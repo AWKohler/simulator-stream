@@ -6,6 +6,9 @@
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   CAMERA_FRAME_VERSION,
+  type AppStoreBuildEvent,
+  type AppStoreBuildState,
+  type AppStoreSigning,
   type BuildDiagnostic,
   type DeviceBuildState,
   type DeviceModel,
@@ -91,6 +94,22 @@ export interface DeviceBuildRecord {
   ipaData?: Buffer;
 }
 
+export interface AppStoreBuildRecord {
+  buildId: string;
+  state: AppStoreBuildState;
+  hostId: string | null;
+  createdAt: number;
+  updatedAt: number;
+  scheme?: string;
+  bundleId?: string;
+  marketingVersion?: string;
+  buildNumber?: string;
+  durationMs?: number;
+  diagnostics: BuildDiagnostic[];
+  logs: DeviceBuildLogLine[];
+  error?: string;
+}
+
 interface PendingBuild {
   tarballBase64: string;
   hints?: { scheme?: string; bundleId?: string };
@@ -105,6 +124,7 @@ export class Orchestrator {
   // placeQueued() once the slot opens. Cleared when the session ends.
   private pendingBuilds = new Map<string, PendingBuild>();
   private deviceBuilds = new Map<string, DeviceBuildRecord>();
+  private appStoreBuilds = new Map<string, AppStoreBuildRecord>();
   private readonly deviceBuildTtlMs = parseInt(
     process.env.DEVICE_BUILD_TTL_MS ?? '1800000',
     10,
@@ -305,6 +325,129 @@ export class Orchestrator {
         this.scheduleDeviceBuildCleanup(msg.buildId);
         break;
     }
+  }
+
+  // ── App Store build lifecycle ─────────────────────────────────────────────
+  // Mirrors the device-build flow, with two differences: the signing payload
+  // is PASSED THROUGH to the host and never stored on the record, and there is
+  // no IPA artifact to retain — the host uploads straight to App Store Connect.
+  createAppStoreBuild(
+    tarballBase64: string,
+    signing: AppStoreSigning,
+    hints?: { scheme?: string; bundleId?: string },
+  ): AppStoreBuildRecord {
+    const buildId = randomUUID();
+    const record: AppStoreBuildRecord = {
+      buildId,
+      state: 'queued',
+      hostId: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      bundleId: signing.bundleId,
+      marketingVersion: signing.marketingVersion,
+      buildNumber: signing.buildNumber,
+      diagnostics: [],
+      logs: [],
+    };
+    this.appStoreBuilds.set(buildId, record);
+
+    const host = this.pickDeviceBuildHost();
+    if (!host) {
+      record.state = 'failed';
+      record.error = 'No host connected for App Store builds.';
+      record.updatedAt = Date.now();
+      this.scheduleAppStoreBuildCleanup(buildId);
+      return record;
+    }
+
+    record.hostId = host.hostId;
+    try {
+      host.send({
+        type: 'build_app_store',
+        buildId,
+        tarballBase64,
+        signing,
+        hints,
+      });
+      log(`App Store build ${buildId.slice(0, 8)} queued on ${host.hostId}`);
+    } catch (e) {
+      record.state = 'failed';
+      record.error = `Failed to send build to host: ${(e as Error).message}`;
+      record.updatedAt = Date.now();
+      this.scheduleAppStoreBuildCleanup(buildId);
+    }
+
+    return record;
+  }
+
+  getAppStoreBuild(buildId: string): AppStoreBuildRecord | null {
+    return this.appStoreBuilds.get(buildId) ?? null;
+  }
+
+  handleAppStoreBuildEvent(msg: {
+    buildId: string;
+    event: AppStoreBuildEvent;
+    line?: string;
+    stream?: LogStream;
+    scheme?: string;
+    bundleId?: string;
+    durationMs?: number;
+    message?: string;
+    diagnostic?: BuildDiagnostic;
+    diagnostics?: BuildDiagnostic[];
+  }): void {
+    const record = this.appStoreBuilds.get(msg.buildId);
+    if (!record) return;
+    record.updatedAt = Date.now();
+
+    switch (msg.event) {
+      case 'started':
+        record.state = 'building';
+        break;
+      case 'exporting':
+        record.state = 'exporting';
+        break;
+      case 'uploading':
+        record.state = 'uploading';
+        break;
+      case 'log':
+        if (msg.line) {
+          record.logs.push({
+            line: msg.line,
+            stream: msg.stream ?? 'stdout',
+            at: Date.now(),
+          });
+          if (record.logs.length > this.maxDeviceBuildLogs) {
+            record.logs.splice(0, record.logs.length - this.maxDeviceBuildLogs);
+          }
+        }
+        break;
+      case 'diagnostic':
+        if (msg.diagnostic) record.diagnostics.push(msg.diagnostic);
+        break;
+      case 'succeeded':
+        record.state = 'succeeded';
+        record.scheme = msg.scheme;
+        if (msg.bundleId) record.bundleId = msg.bundleId;
+        record.durationMs = msg.durationMs;
+        record.diagnostics = msg.diagnostics ?? record.diagnostics;
+        this.scheduleAppStoreBuildCleanup(msg.buildId);
+        break;
+      case 'failed':
+        record.state = 'failed';
+        record.error = msg.message ?? 'App Store build failed.';
+        record.durationMs = msg.durationMs;
+        record.diagnostics = msg.diagnostics ?? record.diagnostics;
+        this.scheduleAppStoreBuildCleanup(msg.buildId);
+        break;
+    }
+  }
+
+  private scheduleAppStoreBuildCleanup(buildId: string): void {
+    const timer = setTimeout(() => {
+      this.appStoreBuilds.delete(buildId);
+    }, this.deviceBuildTtlMs);
+    timer.unref();
   }
 
   // ── Session lifecycle ─────────────────────────────────────────────────────

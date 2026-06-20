@@ -5,6 +5,7 @@ import { Orchestrator } from './orchestrator.js';
 import { SessionProxy } from './proxy.js';
 import { sessionRouter } from './routes/sessions.js';
 import { deviceBuildRouter } from './routes/device-builds.js';
+import { appStoreBuildRouter } from './routes/app-store-builds.js';
 import { attachWS } from './routes/ws.js';
 import { log } from './log.js';
 
@@ -67,6 +68,14 @@ app.use(
   }),
 );
 
+app.use(
+  '/api/app-store-builds',
+  appStoreBuildRouter(orch, {
+    platformToken: PLATFORM_TOKEN,
+    maxBuildBodyBytes: MAX_BUILD_BODY_BYTES,
+  }),
+);
+
 const server = http.createServer(app);
 attachWS(server, orch, proxy, {
   hostToken: HOST_TOKEN,
@@ -81,6 +90,7 @@ server.listen(PORT, BIND_HOST, () => {
   log(`  /api/sessions          — REST (token: ${PLATFORM_TOKEN ? 'required' : 'OPEN'})`);
   log(`  /api/sessions/:id/build — Build upload (token: ${PLATFORM_TOKEN ? 'required' : 'OPEN'})`);
   log(`  /api/device-builds      — Device IPA build upload (token: ${PLATFORM_TOKEN ? 'required' : 'OPEN'})`);
+  log(`  /api/app-store-builds   — App Store signed build + upload (token: ${PLATFORM_TOKEN ? 'required' : 'OPEN'})`);
   log(`  /ws/host               — Host Agent connection (token: ${HOST_TOKEN === 'dev-token' ? 'DEV' : 'configured'})`);
   log(`  /ws/session/:id        — Browser stream (token: ${PLATFORM_TOKEN ? 'required' : 'OPEN'}, origins: ${ALLOWED_ORIGINS.join(',')})`);
 });

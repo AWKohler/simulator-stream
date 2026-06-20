@@ -15,7 +15,7 @@ import type { DeviceModel, Orientation } from '@sim/shared';
 import { detect, hasIDB, stopAllCompanions } from './idb.js';
 import { ensureCompiled } from './capturer.js';
 import { ensureFramebufferCapturer } from './framebuffer-capturer.js';
-import { runDeviceBuild } from './build.js';
+import { runAppStoreBuild, runDeviceBuild, type AppStoreSigningInput } from './build.js';
 import { ControllerClient, type ControllerToHostCmd } from './controller-client.js';
 import { log, warn } from './log.js';
 
@@ -191,6 +191,9 @@ async function main(): Promise<void> {
       case 'build_device':
         void startDeviceBuild(cmd.buildId, cmd.tarballBase64, cmd.hints);
         break;
+      case 'build_app_store':
+        void startAppStoreBuild(cmd.buildId, cmd.tarballBase64, cmd.signing, cmd.hints);
+        break;
       case 'input': {
         const s = sessions.get(cmd.sessionId);
         if (s) void s.handleInput(cmd.input);
@@ -305,6 +308,67 @@ async function main(): Promise<void> {
       warn(`runDeviceBuild ${buildId} threw: ${error.message}`);
       client.send({
         type: 'device_build_event',
+        buildId,
+        event: 'failed',
+        message: error.message,
+        durationMs: Date.now() - startedAt,
+        diagnostics: Array.isArray(error.diagnostics) ? error.diagnostics : undefined,
+      });
+    }
+  }
+
+  async function startAppStoreBuild(
+    buildId: string,
+    tarballBase64: string,
+    signing: AppStoreSigningInput,
+    hints?: { scheme?: string; bundleId?: string },
+  ): Promise<void> {
+    const startedAt = Date.now();
+    client.send({
+      type: 'app_store_build_event',
+      buildId,
+      event: 'started',
+    });
+
+    const tarballBuf = Buffer.from(tarballBase64, 'base64');
+    try {
+      const build = runAppStoreBuild({
+        buildId,
+        tarballBuf,
+        signing,
+        hints,
+        onLog: (line, stream) => {
+          client.send({
+            type: 'app_store_build_event',
+            buildId,
+            event: 'log',
+            line,
+            stream,
+          });
+        },
+        onPhase: (phase) => {
+          client.send({
+            type: 'app_store_build_event',
+            buildId,
+            event: phase,
+          });
+        },
+      });
+      const result = await build.done;
+      client.send({
+        type: 'app_store_build_event',
+        buildId,
+        event: 'succeeded',
+        scheme: result.scheme,
+        bundleId: result.bundleId,
+        durationMs: result.durationMs,
+        diagnostics: result.diagnostics,
+      });
+    } catch (e) {
+      const error = e as Error & { diagnostics?: unknown };
+      warn(`runAppStoreBuild ${buildId} threw: ${error.message}`);
+      client.send({
+        type: 'app_store_build_event',
         buildId,
         event: 'failed',
         message: error.message,

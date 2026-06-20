@@ -37,6 +37,35 @@ export type BuildPhase = z.infer<typeof BuildPhase>;
 export const DeviceBuildState = z.enum(['queued', 'building', 'succeeded', 'failed']);
 export type DeviceBuildState = z.infer<typeof DeviceBuildState>;
 
+// App Store builds (distribution-signed + uploaded to App Store Connect) have
+// two extra phases beyond a device build: export (archive → signed .ipa) and
+// the ASC upload itself. 'succeeded' means Apple ACCEPTED the upload (state
+// AWAITING_UPLOAD → PROCESSING); post-upload processing/TestFlight state is
+// polled platform-side via the ASC API, not tracked here.
+export const AppStoreBuildState = z.enum([
+  'queued',
+  'building',
+  'exporting',
+  'uploading',
+  'succeeded',
+  'failed',
+]);
+export type AppStoreBuildState = z.infer<typeof AppStoreBuildState>;
+
+// Host→controller event phases for App Store builds. Superset of BuildPhase:
+// 'exporting' fires when the archive completes and -exportArchive begins,
+// 'uploading' when the signed IPA starts its App Store Connect upload.
+export const AppStoreBuildEvent = z.enum([
+  'started',
+  'log',
+  'diagnostic',
+  'exporting',
+  'uploading',
+  'succeeded',
+  'failed',
+]);
+export type AppStoreBuildEvent = z.infer<typeof AppStoreBuildEvent>;
+
 export const LogStream = z.enum(['stdout', 'stderr']);
 export type LogStream = z.infer<typeof LogStream>;
 
@@ -310,6 +339,46 @@ export const DeviceBuildSummary = z.object({
 });
 export type DeviceBuildSummary = z.infer<typeof DeviceBuildSummary>;
 
+export const AppStoreBuildSummary = z.object({
+  buildId: z.string(),
+  state: AppStoreBuildState,
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  hostId: z.string().nullable(),
+  scheme: z.string().optional(),
+  bundleId: z.string().optional(),
+  marketingVersion: z.string().optional(),
+  buildNumber: z.string().optional(),
+  durationMs: z.number().optional(),
+  diagnostics: z.array(BuildDiagnostic),
+  logs: z.array(
+    z.object({
+      line: z.string(),
+      stream: LogStream,
+      at: z.number(),
+    }),
+  ),
+  error: z.string().optional(),
+});
+export type AppStoreBuildSummary = z.infer<typeof AppStoreBuildSummary>;
+
+// Distribution-signing + upload credentials for an App Store build. PASS-THROUGH
+// ONLY: the controller forwards this to the host for the duration of one build
+// and must never persist it on the build record or echo it in summaries/logs.
+// p8Base64 is base64 of the .p8 PEM so the JSON wire stays single-line.
+export const AppStoreSigning = z.object({
+  teamId: z.string(),
+  keyId: z.string(),
+  issuerId: z.string(),
+  p8Base64: z.string(),
+  /** ASC `apps` resource id the build uploads to (looked up platform-side). */
+  ascAppId: z.string(),
+  bundleId: z.string(),
+  marketingVersion: z.string(),
+  buildNumber: z.string(),
+});
+export type AppStoreSigning = z.infer<typeof AppStoreSigning>;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Host Agent ↔ Controller — WebSocket messages (/ws/host)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -424,6 +493,20 @@ export const HostDeviceBuildEventMsg = z.object({
   diagnostics: z.array(BuildDiagnostic).optional(),
 });
 
+export const HostAppStoreBuildEventMsg = z.object({
+  type: z.literal('app_store_build_event'),
+  buildId: z.string(),
+  event: AppStoreBuildEvent,
+  line: z.string().optional(),
+  stream: LogStream.optional(),
+  scheme: z.string().optional(),
+  bundleId: z.string().optional(),
+  durationMs: z.number().optional(),
+  message: z.string().optional(),
+  diagnostic: BuildDiagnostic.optional(),
+  diagnostics: z.array(BuildDiagnostic).optional(),
+});
+
 export const HostToController = z.discriminatedUnion('type', [
   HostHelloMsg,
   HostHeartbeatMsg,
@@ -436,6 +519,7 @@ export const HostToController = z.discriminatedUnion('type', [
   HostCameraRequestMsg,
   HostBuildEventMsg,
   HostDeviceBuildEventMsg,
+  HostAppStoreBuildEventMsg,
 ]);
 export type HostToController = z.infer<typeof HostToController>;
 
@@ -499,6 +583,19 @@ export const CtrlBuildDeviceMsg = z.object({
     .optional(),
 });
 
+export const CtrlBuildAppStoreMsg = z.object({
+  type: z.literal('build_app_store'),
+  buildId: z.string(),
+  tarballBase64: z.string(),
+  signing: AppStoreSigning,
+  hints: z
+    .object({
+      scheme: z.string().optional(),
+      bundleId: z.string().optional(),
+    })
+    .optional(),
+});
+
 export const ControllerToHost = z.discriminatedUnion('type', [
   CtrlStartSessionMsg,
   CtrlStopSessionMsg,
@@ -508,6 +605,7 @@ export const ControllerToHost = z.discriminatedUnion('type', [
   CtrlPingMsg,
   CtrlBuildSessionMsg,
   CtrlBuildDeviceMsg,
+  CtrlBuildAppStoreMsg,
   CtrlSetOrientationMsg,
 ]);
 export type ControllerToHost = z.infer<typeof ControllerToHost>;

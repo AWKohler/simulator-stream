@@ -201,6 +201,9 @@ function handleHostConnection(
       case 'device_build_event':
         orch.handleDeviceBuildEvent(msg);
         break;
+      case 'app_store_build_event':
+        orch.handleAppStoreBuildEvent(msg);
+        break;
       case 'hello':
         // Duplicate hello — ignore.
         break;
