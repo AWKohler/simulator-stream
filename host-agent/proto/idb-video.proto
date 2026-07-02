@@ -1,0 +1,61 @@
+// Minimal subset of facebook/idb's idb.proto (v1.1.8) — just enough to call
+// the `video_stream` RPC on idb_companion. The full proto is ~919 lines and
+// pulls in dozens of unrelated messages; we only need the video path.
+//
+// Field numbers and message shapes copied verbatim from the upstream proto so
+// the wire format matches what idb_companion expects.
+
+syntax = "proto3";
+
+package idb;
+
+// Generic payload wrapper used across idb RPCs. For video_stream the companion
+// fills `data` with raw codec bytes (concatenated JPEGs for MJPEG, an Annex-B
+// elementary stream for H264).
+message Payload {
+  oneof source {
+    string file_path = 1;
+    bytes data = 2;
+    string url = 3;
+    Compression compression = 4;
+  }
+  enum Compression {
+    GZIP = 0;
+    ZSTD = 1;
+  }
+}
+
+message VideoStreamRequest {
+  enum Format {
+    H264 = 0;
+    RBGA = 1;
+    MJPEG = 2;
+    MINICAP = 3;
+    I420 = 4;
+  }
+  message Start {
+    string file_path = 1;            // empty → stream over the wire
+    uint64 fps = 2;
+    Format format = 3;
+    double compression_quality = 4;  // 0..1
+    double scale_factor = 5;         // 0..1
+    double avg_bitrate = 6;          // 0 → companion default
+  }
+  message Stop {}
+  oneof control {
+    Start start = 1;
+    Stop stop = 2;
+  }
+}
+
+message VideoStreamResponse {
+  oneof output {
+    bytes log_output = 1;
+    Payload payload = 2;
+  }
+}
+
+service CompanionService {
+  rpc video_stream(stream VideoStreamRequest)
+      returns (stream VideoStreamResponse) {}
+}

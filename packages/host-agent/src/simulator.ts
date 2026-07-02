@@ -366,12 +366,12 @@ export async function probeDeviceLogicalSize(
 // ──────────────────────────────────────────────────────────────────────────────
 // Orientation — detection + rotation
 //
-// On the iOS 26 simulator the captured IOSurface is ALWAYS portrait-native: even
-// when the app is in landscape it renders its landscape layout sideways into the
-// portrait surface. No host-side method changes that, so the BROWSER rotates the
-// video 90° for landscape (see the frontend's device-frame). rotateSimulator's
-// job is only to make the app actually relayout to the target orientation; the
-// browser handles how it's displayed.
+// Rotation is TCC-free and deterministic: we post a Darwin notification into the
+// guest (via `simctl spawn notifypost`), which the running Botflow template app
+// turns into a requestGeometryUpdate(...) call (see rotateSimulator below). No
+// Accessibility, no GUI scripting. getOrientation() reads the simctl screenshot
+// aspect for a coarse check, but the authoritative orientation downstream is the
+// live framebuffer IOSurface size (the capturer is restarted on change).
 // ──────────────────────────────────────────────────────────────────────────────
 
 export async function getOrientation(udid: string): Promise<Orientation | null> {
@@ -390,14 +390,15 @@ export async function rotateSimulator(
   udid: string,
   target: Orientation,
 ): Promise<Orientation> {
-  // Make the app relayout to `target`. We drive the Simulator's "Device ▸
-  // Orientation" menu via osascript (running under the host-agent's `node`, which
-  // has a one-time Accessibility grant on the host — a stable binary, so the
-  // grant sticks; no per-app prompts). The app must allow the orientation —
-  // guaranteed by the build.ts plist overrides. NOTE: on iOS 26 this does NOT
-  // change the captured framebuffer's dimensions (it stays portrait, content
-  // sideways); the browser rotates the video 90° for display. So we don't rely
-  // on a dimension change here — we just trigger the relayout.
+  // Rotate the DEVICE (not just the app interface). Forcing the app's interface
+  // orientation (requestGeometryUpdate) only spins the app's view inside a
+  // still-portrait device surface — the framebuffer stays portrait and content
+  // renders sideways. The Simulator's "Device ▸ Orientation" menu rotates the
+  // actual device: the IOSurface is reallocated at the new dims and the app
+  // relayouts upright (it must allow the orientation — guaranteed by the
+  // build.ts plist overrides). We drive that menu via osascript, which runs
+  // under the host-agent's `node` (granted Accessibility once on the host — a
+  // stable binary, so the grant sticks; no per-app prompts).
   const name = (getDeviceName(udid) ?? '').replace(/["\\]/g, '');
   const orientItem = target === 'landscape' ? 'Landscape Right' : 'Portrait';
   const osa = [
