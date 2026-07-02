@@ -3,15 +3,23 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { BuildDiagnostic, LogStream } from '@sim/shared';
-import { execAsync } from './util.js';
+import { execAsync, execAsSimUser, simUserEnabled } from './util.js';
+import { ensureOrientationShim } from './orientation-shim.js';
 import { log, warn } from './log.js';
 import { parseProjectYml, type ProjectInfo } from './project-yml.js';
 import { extractDiagnostics, sanitizeLine } from './build-diagnostics.js';
+import { assertBuildBackendReady } from './build-runner.js';
 import { normalizeP8, uploadIpaToAppStoreConnect } from './asc-upload.js';
 import { ensureSigningAssets } from './asc-signing.js';
 import { ensureAppStoreIcon } from './default-icon.js';
 
-const BUILDS_ROOT = path.join(tmpdir(), 'sim-builds');
+// In sim-user mode builds run as simhost in a shared /tmp dir (simhost can't
+// write the orchestrator's private tmpdir, and the orchestrator reads the
+// xcresult/.app back out). Exported so session.ts derives the same per-session
+// workdir for its live-diagnostic path rewriting.
+export const BUILDS_ROOT = simUserEnabled()
+  ? '/tmp/sim-builds'
+  : path.join(tmpdir(), 'sim-builds');
 
 export interface BuildResult {
   appBundlePath: string;
@@ -201,7 +209,13 @@ export interface DeviceBuildHandle {
   cancel: () => void;
 }
 
+// This function IS the 'local-simuser' build backend (see build-runner.ts).
+// The decided end state queues this work through the 2-VM slot system; when that
+// lands, a VmQueueBuildRunner satisfies the same contract and the guard below
+// routes to it. Until then, building with VM_BUILD_QUEUE_URL set is an error
+// rather than a silent fallback to bare-metal.
 export function runBuild(options: BuildOptions): BuildHandle {
+  assertBuildBackendReady();
   const { sessionId, tarballBuf, hints, onLog } = options;
   const workdir = path.join(BUILDS_ROOT, sessionId);
   let proc: ChildProcess | null = null;
@@ -864,34 +878,48 @@ export async function installAndLaunch(
   bundleId: string,
   camera?: LaunchCameraInjection | null,
 ): Promise<void> {
-  const install = await execAsync(`xcrun simctl install ${udid} "${appBundlePath}"`, {
-    timeoutMs: 60_000,
-  });
+  // Install into (and launch in) the sim user's simulator. The build ran as the
+  // orchestrator but wrote the .app under shared /tmp, so simhost can read it.
+  const installCmd = `xcrun simctl install ${udid} "${appBundlePath}"`;
+  const install = simUserEnabled()
+    ? await execAsSimUser(installCmd, { timeoutMs: 60_000 })
+    : await execAsync(installCmd, { timeoutMs: 60_000 });
   if (install.code !== 0) {
     throw new Error(`simctl install failed: ${install.stderr || install.stdout}`);
   }
-  // `simctl launch` forwards SIMCTL_CHILD_*-prefixed env vars to the app process.
-  // We use that to inject the camera shim (DYLD_INSERT_LIBRARIES) and tell it
-  // where to dial for webcam frames — without touching the user's project.
-  //
-  // NOTE: rotation is NOT done via app-side injection. Forcing the app's
-  // interface orientation (requestGeometryUpdate) only rotates the app's view
-  // WITHIN a still-portrait device surface — the framebuffer stays portrait and
-  // the content renders sideways. True rotation is a DEVICE rotation (the
-  // simulator surface itself), handled host-side in rotateSimulator(). The plist
-  // overrides above just ensure the app is *allowed* to follow that rotation.
-  const env: NodeJS.ProcessEnv | undefined = camera
-    ? {
-        SIMCTL_CHILD_DYLD_INSERT_LIBRARIES: camera.dyldPath,
-        SIMCTL_CHILD_BOTFLOW_CAMERA_URL: camera.cameraUrl,
-      }
-    : undefined;
-  // simctl launch returns immediately with PID; use --terminate-running-process so a
-  // rebuild replaces the previous process cleanly.
-  const launch = await execAsync(
-    `xcrun simctl launch --terminate-running-process ${udid} ${bundleId}`,
-    { timeoutMs: 15_000, env },
-  );
+
+  // `simctl launch` forwards SIMCTL_CHILD_*-prefixed env to the app process — we
+  // DYLD-inject two shims through it without touching the user's project:
+  //  (a) the orientation shim — its Darwin-notification observer is what
+  //      rotateSimulator() drives via notifypost() for headless rotation;
+  //  (b) the camera shim when a webcam session is active.
+  // In sim-user mode these are set inline via `env VAR=val` because sudo strips
+  // the environment; otherwise via execAsync's env option.
+  const dylibs: string[] = [];
+  if (simUserEnabled() && process.env.SIM_ORIENT_DYLIB) {
+    dylibs.push(await ensureOrientationShim());
+  }
+  if (camera) dylibs.push(camera.dyldPath);
+  const childEnv: Record<string, string> = {};
+  if (dylibs.length) childEnv.SIMCTL_CHILD_DYLD_INSERT_LIBRARIES = dylibs.join(':');
+  if (camera) childEnv.SIMCTL_CHILD_BOTFLOW_CAMERA_URL = camera.cameraUrl;
+
+  // --terminate-running-process so a rebuild replaces the previous process cleanly.
+  const launchCore = `xcrun simctl launch --terminate-running-process ${udid} ${bundleId}`;
+  let launch;
+  if (simUserEnabled()) {
+    const envPrefix = Object.entries(childEnv)
+      .map(([k, v]) => `${k}='${v}'`)
+      .join(' ');
+    launch = await execAsSimUser(envPrefix ? `env ${envPrefix} ${launchCore}` : launchCore, {
+      timeoutMs: 15_000,
+    });
+  } else {
+    launch = await execAsync(launchCore, {
+      timeoutMs: 15_000,
+      env: Object.keys(childEnv).length ? childEnv : undefined,
+    });
+  }
   if (launch.code !== 0) {
     throw new Error(`simctl launch failed: ${launch.stderr || launch.stdout}`);
   }

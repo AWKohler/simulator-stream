@@ -150,6 +150,123 @@ Edit the plist's `EnvironmentVariables` block to reference per-VM env via the
 `/etc/sim-vm/env` file (the launchd unit reads it on every load — see the
 comments inside the plist).
 
+## Step 4.5 — Performance + compatibility bakes (REQUIRED — added 2026-06-28)
+
+Validated on M5 Pro/64GB. Without these, a fresh clone (a) crashes the
+framebuffer capturer, and (b) builds are several× slower (virtio-disk I/O +
+cold SPM). These four steps take a cold session from ~60–96s down to a ~14s
+build + ~22s sim. All run **inside the VM** before the Step-5 clone.
+
+**1. `/Applications/Xcode.app` symlink (compatibility — fixes a hard crash).**
+The capturer (`framebuffer-capturer/main.mm`) hardcodes `/Applications/Xcode.app`,
+but Cirrus installs Xcode under a versioned name. Without this the session dies
+with `dlopen SimulatorKit failed … no such file` and retry-loops.
+
+```bash
+# point at whatever the real Xcode bundle is named
+sudo ln -sfn /Applications/Xcode_26.4.1.app /Applications/Xcode.app
+ls -l /Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit  # must resolve
+```
+
+**2. Warm the SPM cache (the "prebuilt Convex SDK" — saves ~23s/session).**
+Single-use VMs are cold clones, so each otherwise re-clones the ~380MB
+`get-convex/convex-swift` package on every build. Resolve it once so the cache
+(`~/Library/Caches/org.swift.swiftpm`, ~233MB) is baked in. Easiest: run one
+real build of a representative Swift+Convex project, or
+`xcodebuild -resolvePackageDependencies` against one. Contains no user data.
+
+```bash
+du -sh ~/Library/Caches/org.swift.swiftpm   # expect ~233M once warm
+```
+
+**3. RAM-disk the build I/O (eliminates the virtio-disk I/O stall).**
+The build dir (`$TMPDIR/sim-builds`) hammers small-random-I/O; on the virtio
+disk that's the dominant cost. A boot LaunchDaemon recreates an 8GB RAM disk +
+disables Spotlight each boot (ephemeral → reinforces the fresh-build isolation
+model). GOTCHA: `hdiutil` pads its device-node output with trailing spaces —
+you MUST `awk '{print $1}'` it or `diskutil` fails with "Unable to find disk".
+
+```bash
+sudo tee /usr/local/sbin/sim-ramdisk.sh >/dev/null <<'EOF'
+#!/bin/bash
+if diskutil info RAMDisk >/dev/null 2>&1; then exit 0; fi
+DEV=$(hdiutil attach -nomount ram://16777216 | awk '{print $1}')   # 8GB; awk-trim!
+[ -z "$DEV" ] && exit 1
+diskutil erasevolume HFS+ RAMDisk "$DEV" || exit 1
+chmod 1777 /Volumes/RAMDisk
+mdutil -i off /Volumes/RAMDisk 2>/dev/null || true
+mdutil -d  /Volumes/RAMDisk 2>/dev/null || true
+exit 0
+EOF
+sudo chmod 755 /usr/local/sbin/sim-ramdisk.sh
+sudo tee /Library/LaunchDaemons/com.simstream.ramdisk.plist >/dev/null <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.simstream.ramdisk</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>/usr/local/sbin/sim-ramdisk.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/sim-ramdisk.log</string>
+  <key>StandardErrorPath</key><string>/tmp/sim-ramdisk.log</string>
+</dict></plist>
+EOF
+```
+
+**4. Point the host-agent's `TMPDIR` at the RAM disk.**
+So `os.tmpdir()`/`sim-builds` land in RAM. The host-agent plist's command string
+contains a literal `&&` (invalid XML) so **PlistBuddy can't edit it — use `sed`**:
+
+```bash
+sed -i '' 's|sleep 8; set -a;|export TMPDIR=/Volumes/RAMDisk; sleep 8; set -a;|' \
+  ~/Library/LaunchAgents/com.simstream.host-agent.plist
+```
+
+`vm-manager` therefore does NOT need to write `TMPDIR` into `/etc/sim-vm/env`.
+
+**5. Self-warming build at boot (collapses the cold-clone FIRST build 70s → ~7s).**
+The baked SPM cache (step 2) avoids re-*downloading* convex-swift, but a freshly
+booted clone still has an empty OS page cache, so its first build spends ~70s
+reading the cache + extracting checkouts off the (cold) virtio disk. Fix: bake a
+representative Convex project and a LaunchAgent that builds it once at boot — this
+warms the OS page cache (SPM + Xcode + SDK) *off the user's critical path* (during
+the warm-pool window, before vm-manager assigns the VM). Single-use isolation is
+fully preserved: the warm-up uses NO user data, and each VM is still a one-shot
+clone. Measured: warm-up ~15–70s at boot (background) → user's first build **~7s**.
+
+```bash
+# representative project = any Botflow-generated Swift+Convex project's SOURCE (no build/)
+mkdir -p ~/warmup && rsync -a --exclude build --exclude '*.xcresult' /path/to/project/ ~/warmup/
+cat > ~/warmup-build.sh <<'EOF'
+#!/bin/bash
+exec > /tmp/sim-warmup.out 2>&1
+for i in $(seq 1 30); do [ -d /Volumes/RAMDisk ] && break; sleep 1; done   # wait for ramdisk
+WORK=/Volumes/RAMDisk/warmup-build; rm -rf "$WORK"; mkdir -p "$WORK"; cp -R "$HOME/warmup/." "$WORK"/
+cd "$WORK"; ~/.local/bin/xcodegen generate 2>/dev/null || true
+xcodebuild -project MyApp.xcodeproj -scheme MyApp -sdk iphonesimulator -derivedDataPath build \
+  ONLY_ACTIVE_ARCH=YES ARCHS=arm64 CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+  build >/dev/null 2>&1 && echo "[warmup] OK" || echo "[warmup] FAIL"
+rm -rf "$WORK"   # discard output; only the warmed OS cache matters
+EOF
+chmod +x ~/warmup-build.sh
+cat > ~/Library/LaunchAgents/com.simstream.warmup.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.simstream.warmup</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>/Users/admin/warmup-build.sh</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/Users/admin/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+</dict></plist>
+EOF
+```
+
+After Step 5, verify a fresh clone cold-boots with all five auto-applied (no
+manual steps): `readlink /Applications/Xcode.app`, `du -sh ~/Library/Caches/org.swift.swiftpm`,
+`df -h /Volumes/RAMDisk`, `ps eww $(pgrep -f 'pnpm dev:host') | tr ' ' '\n' | grep TMPDIR`,
+and `cat /tmp/sim-warmup.out` (should show `[warmup] OK`).
+
 ## Step 5 — Stop the base, clone to `golden`, delete base
 
 In shell A: `Ctrl-C` to stop the running base VM. Then in any shell:

@@ -1,5 +1,4 @@
 import { EventEmitter } from 'node:events';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type {
   BuildDiagnostic,
@@ -41,6 +40,7 @@ import { computeScreenRect, windowNormToDeviceLogical, clampPt } from './coordin
 import { sleep } from './util.js';
 import { err, log, warn } from './log.js';
 import {
+  BUILDS_ROOT,
   BuildAborted,
   installAndLaunch,
   runBuild,
@@ -383,7 +383,7 @@ export class Session extends EventEmitter {
 
     // Workdir mirrors what runBuild constructs; needed to feed the live regex
     // parser the same path-rewrite context the sanitizer uses.
-    const buildWorkdir = path.join(tmpdir(), 'sim-builds', this.sessionId);
+    const buildWorkdir = path.join(BUILDS_ROOT, this.sessionId);
     const handle = runBuild({
       sessionId: this.sessionId,
       tarballBuf,

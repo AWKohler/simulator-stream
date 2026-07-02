@@ -1,7 +1,7 @@
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { execAsync } from './util.js';
+import { execAsSimUser, spawnAsSimUser, simUserEnabled } from './util.js';
 import { log, warn } from './log.js';
 
 // pip3/conda can install idb into various prefixes depending on the environment.
@@ -33,6 +33,17 @@ export function hasIDB(): boolean {
 }
 
 export function detect(): { hasIDB: boolean; idbBin: string | null; companionBin: string | null } {
+  // In sim-user mode the toolchain is pre-provisioned at shared, simhost-runnable
+  // paths (simhost can't reach the orchestrator's private installs). Use those
+  // directly rather than PATH detection, which would find the orchestrator's copy.
+  if (simUserEnabled()) {
+    idbBin = process.env.SIM_IDB_BIN ?? null;
+    companionBin = process.env.SIM_COMPANION_BIN ?? null;
+    if (idbBin) log(`idb (sim-user) at: ${idbBin}`);
+    else warn('SIM_IDB_BIN unset — touch injection disabled in sim-user mode.');
+    if (companionBin) log(`idb_companion (sim-user) at: ${companionBin}`);
+    return { hasIDB: !!idbBin, idbBin, companionBin };
+  }
   // Try shell PATH first — picks up pyenv, conda, etc.
   try {
     const found = execSync('bash -lc "which idb"', { stdio: 'pipe' }).toString().trim();
@@ -93,12 +104,17 @@ export function startCompanion(udid: string): void {
   if (companions.has(udid)) return;
   try {
     mkdirSync(IDB_SOCK_DIR, { recursive: true });
+    // The companion runs as the sim user and binds its socket here, while the
+    // orchestrator (a different user) may also need to reach it — make the dir
+    // world-writable+sticky (like /tmp) so the socket can be created/used cross-user.
+    if (simUserEnabled()) chmodSync(IDB_SOCK_DIR, 0o1777);
   } catch {
     /* already exists */
   }
   const sock = companionSocketPath(udid);
   log(`Starting idb_companion for ${udid} (sock=${sock})...`);
-  const proc = spawn(companionBin, ['--udid', udid, '--grpc-domain-sock', sock], {
+  const spawned = spawnAsSimUser(companionBin, ['--udid', udid, '--grpc-domain-sock', sock]);
+  const proc = spawn(spawned.cmd, spawned.args, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   proc.stderr?.on('data', (d: Buffer) => {
@@ -140,7 +156,7 @@ export function stopAllCompanions(): void {
 async function idbCmd(udid: string, args: string, label: string): Promise<void> {
   if (!idbBin) return;
   const cmd = `"${idbBin}" ${args} --udid ${udid}`;
-  const res = await execAsync(cmd, { timeoutMs: 5_000 });
+  const res = await execAsSimUser(cmd, { timeoutMs: 5_000 });
   if (res.code !== 0) {
     warn(`idb ${label} failed: ${(res.stderr || res.stdout).split('\n')[0]}`);
   }
@@ -195,7 +211,9 @@ export function hidCodeForKey(key: string): number | null {
 export async function sendText(udid: string, text: string): Promise<void> {
   if (!idbBin || text.length === 0) return;
   await new Promise<void>((resolve) => {
-    const proc = spawn(idbBin!, ['ui', 'text', text, '--udid', udid], {
+    // text is untrusted — keep it a discrete argv element (no shell string).
+    const spawned = spawnAsSimUser(idbBin!, ['ui', 'text', text, '--udid', udid]);
+    const proc = spawn(spawned.cmd, spawned.args, {
       stdio: ['ignore', 'ignore', 'pipe'],
     });
     let stderr = '';

@@ -1,9 +1,15 @@
 import { execSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { DeviceModel, Orientation } from '@sim/shared';
-import { execAsync, sleep } from './util.js';
+import { execAsync, execAsSimUser, wrapAsSimUser, simUserEnabled, sleep } from './util.js';
+import { postOrientation } from './notifypost.js';
 import { log, warn } from './log.js';
+
+// All CoreSimulator commands target the SIM USER's device set (see util.ts).
+// In dev/VM (SIM_RUN_USER unset) wrapAsSimUser is a no-op, so these are plain.
+// Cross-user files (screenshots simhost writes + the orchestrator reads) go to
+// /tmp, which both users can access.
+const SHARED_TMP = '/tmp';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // simctl JSON types
@@ -32,7 +38,9 @@ interface SimctlRuntime {
 // ──────────────────────────────────────────────────────────────────────────────
 
 function readDevices(): SimctlList {
-  return JSON.parse(execSync('xcrun simctl list devices --json').toString()) as SimctlList;
+  return JSON.parse(
+    execSync(wrapAsSimUser('xcrun simctl list devices --json')).toString(),
+  ) as SimctlList;
 }
 
 export function listSimulators(): SimctlDevice[] {
@@ -53,7 +61,9 @@ export function findByName(name: string): SimctlDevice | null {
 }
 
 function listIOSRuntimes(): SimctlRuntime[] {
-  const json = JSON.parse(execSync('xcrun simctl list runtimes --json').toString()) as {
+  const json = JSON.parse(
+    execSync(wrapAsSimUser('xcrun simctl list runtimes --json')).toString(),
+  ) as {
     runtimes: SimctlRuntime[];
   };
   return json.runtimes.filter((r) => r.isAvailable && r.identifier.includes('iOS'));
@@ -84,7 +94,9 @@ interface SimctlDeviceType {
 
 function listDeviceTypes(): SimctlDeviceType[] {
   try {
-    const json = JSON.parse(execSync('xcrun simctl list devicetypes --json').toString()) as {
+    const json = JSON.parse(
+      execSync(wrapAsSimUser('xcrun simctl list devicetypes --json')).toString(),
+    ) as {
       devicetypes: SimctlDeviceType[];
     };
     return json.devicetypes ?? [];
@@ -167,7 +179,7 @@ export async function ensurePool(slots: number): Promise<string[]> {
       continue;
     }
     log(`Creating pool device ${name} (runtime ${runtimeId})...`);
-    const res = await execAsync(
+    const res = await execAsSimUser(
       `xcrun simctl create "${name}" "${DEVICE_TYPE}" "${runtimeId}"`,
     );
     if (res.code !== 0) {
@@ -189,10 +201,13 @@ export async function bootSimulator(udid: string, timeoutMs = 90_000): Promise<b
   log(`Booting ${udid}...`);
   // Don't await — `simctl boot` blocks until boot completes which can be slow;
   // we poll state instead so we can surface progress.
-  void execAsync(`xcrun simctl boot ${udid}`).catch(() => undefined);
+  void execAsSimUser(`xcrun simctl boot ${udid}`).catch(() => undefined);
 
-  // Make sure Simulator.app is open so the window appears.
-  await execAsync('open -a Simulator');
+  // Open Simulator.app (window capture) only in legacy/dev single-user mode.
+  // In sim-user mode we run headless: the framebuffer capturer attaches to the
+  // device's IOSurface by UDID, so no on-screen window is needed (and we can't
+  // render one in a background user's session anyway).
+  if (!simUserEnabled()) await execAsync('open -a Simulator');
 
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -214,7 +229,7 @@ export async function shutdownSimulator(udid: string): Promise<boolean> {
   if (state === 'Shutdown' || state === 'Unknown') return true;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
-    await execAsync(`xcrun simctl shutdown ${udid}`, { timeoutMs: 30_000 });
+    await execAsSimUser(`xcrun simctl shutdown ${udid}`, { timeoutMs: 30_000 });
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
       if (getSimulatorState(udid) === 'Shutdown') return true;
@@ -246,7 +261,7 @@ export async function eraseSimulator(udid: string): Promise<boolean> {
     return false;
   }
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const res = await execAsync(`xcrun simctl erase ${udid}`, { timeoutMs: 30_000 });
+    const res = await execAsSimUser(`xcrun simctl erase ${udid}`, { timeoutMs: 30_000 });
     if (res.code === 0) {
       log(`erase ${udid.slice(0, 8)} ok (attempt ${attempt})`);
       return true;
@@ -259,7 +274,7 @@ export async function eraseSimulator(udid: string): Promise<boolean> {
       // Sledgehammer: shut down EVERY booted sim. CoreSimulator services
       // sometimes wedge on one device and refuse erase on others until
       // they're all idle. Best-effort; ignore exit code.
-      await execAsync('xcrun simctl shutdown all', { timeoutMs: 30_000 });
+      await execAsSimUser('xcrun simctl shutdown all', { timeoutMs: 30_000 });
       await sleep(500);
     }
   }
@@ -292,7 +307,7 @@ export async function recreatePoolDevice(
   log(`Recreating pool device ${name} (${udid.slice(0, 8)}) as ${targetType.split('.').pop()}...`);
   // Best-effort shutdown — `simctl delete` of a Booted device may hang.
   await shutdownSimulator(udid);
-  const delRes = await execAsync(`xcrun simctl delete ${udid}`, { timeoutMs: 30_000 });
+  const delRes = await execAsSimUser(`xcrun simctl delete ${udid}`, { timeoutMs: 30_000 });
   if (delRes.code !== 0) {
     warn(`delete ${udid.slice(0, 8)} failed: ${(delRes.stderr || delRes.stdout).split('\n')[0]}`);
     return null;
@@ -300,7 +315,7 @@ export async function recreatePoolDevice(
   const runtimes = listIOSRuntimes();
   if (runtimes.length === 0) return null;
   runtimes.sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
-  const createRes = await execAsync(
+  const createRes = await execAsSimUser(
     `xcrun simctl create "${name}" "${targetType}" "${runtimes[0].identifier}"`,
   );
   if (createRes.code !== 0) {
@@ -349,8 +364,12 @@ export async function probeDeviceLogicalSize(
   udid: string,
   scaleHint?: number,
 ): Promise<{ w: number; h: number } | null> {
-  const tmp = path.join(tmpdir(), `expo_probe_${udid}.jpg`);
-  const screenshot = await execAsync(`xcrun simctl io ${udid} screenshot --type=jpeg "${tmp}"`);
+  // /tmp (not the orchestrator's private tmpdir): simhost writes the screenshot,
+  // the orchestrator reads it for sips — they're different users.
+  const tmp = path.join(SHARED_TMP, `expo_probe_${udid}.jpg`);
+  const screenshot = await execAsSimUser(
+    `xcrun simctl io ${udid} screenshot --type=jpeg "${tmp}"`,
+  );
   if (screenshot.code !== 0) return null;
   const sips = await execAsync(`sips -g pixelWidth -g pixelHeight "${tmp}"`);
   if (sips.code !== 0) return null;
@@ -375,8 +394,8 @@ export async function probeDeviceLogicalSize(
 // ──────────────────────────────────────────────────────────────────────────────
 
 export async function getOrientation(udid: string): Promise<Orientation | null> {
-  const tmp = path.join(tmpdir(), `expo_orient_${udid}.jpg`);
-  const shot = await execAsync(`xcrun simctl io ${udid} screenshot --type=jpeg "${tmp}"`);
+  const tmp = path.join(SHARED_TMP, `expo_orient_${udid}.jpg`);
+  const shot = await execAsSimUser(`xcrun simctl io ${udid} screenshot --type=jpeg "${tmp}"`);
   if (shot.code !== 0) return null;
   const sips = await execAsync(`sips -g pixelWidth -g pixelHeight "${tmp}"`);
   if (sips.code !== 0) return null;
@@ -390,6 +409,17 @@ export async function rotateSimulator(
   udid: string,
   target: Orientation,
 ): Promise<Orientation> {
+  // Headless rotation (sim-user mode): we don't drive Simulator.app's menus.
+  // Instead post a Darwin notification that the injected BotflowPreviewOrientation
+  // shim turns into a requestGeometryUpdate — the app relayouts to `target`. On
+  // iOS 26 the captured IOSurface stays portrait-native regardless, so the
+  // browser rotates the video 90° for display (same as the osascript path did).
+  // Requires the orientation shim to be DYLD-injected at app launch.
+  if (simUserEnabled()) {
+    const ok = await postOrientation(udid, target);
+    if (!ok) warn('rotateSimulator: notifypost failed (orientation shim injected at launch?)');
+    return target;
+  }
   // Make the app relayout to `target`. We drive the Simulator's "Device ▸
   // Orientation" menu via osascript (running under the host-agent's `node`, which
   // has a one-time Accessibility grant on the host — a stable binary, so the

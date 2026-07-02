@@ -2,12 +2,16 @@ import { execFile, spawn } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnAsSimUser } from './util.js';
 import { log, warn } from './log.js';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE = path.join(PKG_ROOT, 'native', 'framebuffer-capturer', 'main.mm');
 const BUILD_DIR = path.join(PKG_ROOT, 'native', 'framebuffer-capturer', 'build');
-const BIN = path.join(BUILD_DIR, 'framebuffer-capturer');
+// In sim-user mode the capturer is pre-provisioned at a shared, simhost-runnable
+// path (SIM_CAPTURER_BIN, e.g. /opt/sim-tools/...) since simhost can't read the
+// orchestrator's private package dir. Otherwise it's built into the package.
+const BIN = process.env.SIM_CAPTURER_BIN || path.join(BUILD_DIR, 'framebuffer-capturer');
 
 export interface FramebufferVideoConfig {
   codec: 'h264';
@@ -48,6 +52,9 @@ interface NativeRecord {
 }
 
 export async function ensureFramebufferCapturer(): Promise<void> {
+  // Pre-provisioned (sim-user mode): the binary is already built + placed at a
+  // shared path we can't/​shouldn't recompile into. Trust it.
+  if (process.env.SIM_CAPTURER_BIN) return;
   const sourceMtime = statSync(SOURCE).mtimeMs;
   const binaryFresh = existsSync(BIN) && statSync(BIN).mtimeMs >= sourceMtime;
   if (binaryFresh) return;
@@ -103,22 +110,21 @@ export function startFramebufferCapturer(
   options: FramebufferCapturerOptions,
   events: FramebufferCapturerEvents,
 ): FramebufferCapturerHandle {
-  const proc = spawn(
-    BIN,
-    [
-      '--udid',
-      options.udid,
-      '--codec',
-      'h264',
-      '--fps',
-      String(options.fps),
-      '--bitrate',
-      String(options.bitrate),
-      '--keyframe-interval',
-      String(options.keyframeInterval),
-    ],
-    { stdio: ['ignore', 'pipe', 'pipe'] },
-  );
+  // Runs as the sim user — attaches to that user's CoreSimulator framebuffer by
+  // UDID (headless; no on-screen window). Frames stream back over stdout.
+  const spawned = spawnAsSimUser(BIN, [
+    '--udid',
+    options.udid,
+    '--codec',
+    'h264',
+    '--fps',
+    String(options.fps),
+    '--bitrate',
+    String(options.bitrate),
+    '--keyframe-interval',
+    String(options.keyframeInterval),
+  ]);
+  const proc = spawn(spawned.cmd, spawned.args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   let stopped = false;
   const parser = new RecordParser((record) => {
