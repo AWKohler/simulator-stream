@@ -20,6 +20,7 @@ import { readFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { LogStream } from '@sim/shared';
+import { simUserEnabled, spawnAsSimUser } from './util.js';
 import { log, warn } from './log.js';
 
 // Resolve the absolute path to `simctl` ONCE at module load. Every frame
@@ -127,6 +128,9 @@ export function startSimctlCapturer(
 // macOS 26's `simctl io ... screenshot -` writes nothing to stdout (only a
 // "No display specified" note to stderr). Round-trip through a tmpfile.
 function captureOne(udid: string): Promise<Buffer> {
+  // Sim-user mode: the devices live in the sim user's device set, so the
+  // botflow-side simctl here would fail with "Invalid device". Route it.
+  if (simUserEnabled()) return captureOneAsSimUser(udid);
   const tmp = path.join(
     tmpdir(),
     `sim-shot-${udid.slice(0, 8)}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.jpg`,
@@ -158,6 +162,38 @@ function captureOne(udid: string): Promise<Buffer> {
           reject(new Error(`readFile failed: ${(e as Error).message}`));
         },
       );
+    });
+    proc.on('error', reject);
+  });
+}
+
+// Sim-user variant: the screenshot must be TAKEN by the sim user (the device
+// is in its set) and land somewhere both users can touch — the orchestrator's
+// tmpdir() is 0700. Written to shared /tmp, streamed back over stdout via cat,
+// and cleaned up by the sim user itself in the same shell (sticky /tmp forbids
+// a cross-user unlink). One process per frame, like the direct path.
+function captureOneAsSimUser(udid: string): Promise<Buffer> {
+  const tmp = `/tmp/sim-shot-${udid.slice(0, 8)}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+  const simctl = [SIMCTL_BIN, ...SIMCTL_PREFIX_ARGS].map((p) => `"${p}"`).join(' ');
+  // Preserve the screenshot's exit code past the rm (`rm -f` always succeeds).
+  const script = `${simctl} io ${udid} screenshot --type=jpeg "${tmp}" && /bin/cat "${tmp}"; s=$?; /bin/rm -f "${tmp}"; exit $s`;
+  const spawned = spawnAsSimUser('/bin/sh', ['-c', script]);
+  return new Promise<Buffer>((resolve, reject) => {
+    const proc = spawn(spawned.cmd, spawned.args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = [];
+    let stderr = '';
+    proc.stdout.on('data', (c: Buffer) => chunks.push(c));
+    proc.stderr.on('data', (c: Buffer) => {
+      stderr += c.toString();
+    });
+    proc.on('exit', (code) => {
+      if (code !== 0) {
+        reject(new Error(`simctl exit ${code}: ${stderr.trim().split('\n').pop()}`));
+        return;
+      }
+      const buf = Buffer.concat(chunks);
+      if (buf.length === 0) reject(new Error('simctl wrote empty file'));
+      else resolve(buf);
     });
     proc.on('error', reject);
   });
