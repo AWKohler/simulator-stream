@@ -761,7 +761,7 @@ export function runAppStoreBuild(options: AppStoreBuildOptions): AppStoreBuildHa
       const exportPlist = path.join(workdir, 'ExportOptions.plist');
       writeFileSync(
         exportPlist,
-        exportOptionsPlist(signing.teamId, signing.bundleId, profileName),
+        exportOptionsPlist(signing.teamId, signing.bundleId, profileName, signingIdentity),
       );
       // Re-unlock right before export — codesign runs again here and a
       // re-locked keychain would silently fail the re-sign.
@@ -821,7 +821,16 @@ export function runAppStoreBuild(options: AppStoreBuildOptions): AppStoreBuildHa
   return { done, cancel };
 }
 
-function exportOptionsPlist(teamId: string, bundleId: string, profileName: string): string {
+function exportOptionsPlist(
+  teamId: string,
+  bundleId: string,
+  profileName: string,
+  // Exact signing identity (SHA-1 fingerprint from ensureSigningAssets). `-export
+  // Archive` re-signs, so this MUST pin the same cert the archive used and the
+  // profile embeds — a generic "Apple Distribution" is ambiguous when the team
+  // has multiple distribution certs and can pick one the profile doesn't include.
+  signingCertificate: string,
+): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -838,7 +847,7 @@ function exportOptionsPlist(teamId: string, bundleId: string, profileName: strin
     <string>${profileName}</string>
   </dict>
   <key>signingCertificate</key>
-  <string>Apple Distribution</string>
+  <string>${signingCertificate}</string>
   <key>uploadSymbols</key>
   <true/>
   <key>destination</key>
