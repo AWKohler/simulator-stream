@@ -17,7 +17,7 @@ import { ensureCompiled } from './capturer.js';
 import { ensureFramebufferCapturer } from './framebuffer-capturer.js';
 import { runAppStoreBuild, runDeviceBuild, type AppStoreSigningInput } from './build.js';
 import { selectedBuildBackend } from './build-runner.js';
-import { runVmAppStoreBuild, runVmDeviceBuild } from './vm-build-runner.js';
+import { primeVmBuildPool, runVmAppStoreBuild, runVmDeviceBuild } from './vm-build-runner.js';
 import { ControllerClient, type ControllerToHostCmd } from './controller-client.js';
 import { log, warn } from './log.js';
 
@@ -107,6 +107,9 @@ function releaseUdid(udid: string): void {
 
 async function main(): Promise<void> {
   log(`Host ${HOST_ID} starting (slots=${HOST_SLOTS}, kind=${HOST_KIND}, capture=${CAPTURE_MODE}, idb=${hasIDB()})`);
+  // Pre-boot + pre-warm the build VMs so the first build isn't the one that pays
+  // for boot and page-cache warm-up. No-op unless the vm-queue backend is on.
+  if (selectedBuildBackend() === 'vm-queue') primeVmBuildPool();
 
   // Capability detection up-front so the first session doesn't pay these costs.
   const detected = detect();

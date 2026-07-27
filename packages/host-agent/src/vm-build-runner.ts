@@ -18,11 +18,15 @@
 //
 // Capacity: Virtualization.framework hard-caps concurrent macOS guests at 2 per
 // host (empirically confirmed — a 3rd `tart run` fails with "The number of VMs
-// exceeds the system limit"). Builds beyond the live slots wait in `pending`;
-// builds are short (~8s measured), so the queue drains fast.
+// exceeds the system limit"). ALL build flavors share those 2 slots; overflow
+// waits in a FIFO queue.
 //
-// Measured on the M5 Pro host: clone 0s (copy-on-write), boot→ssh 8s,
-// xcodebuild 8s — i.e. parity with bare metal once a slot is warm.
+// Performance: a naive boot-per-build measured ~45s vs ~11s bare metal. The cost
+// was NOT teardown (1s) but a cold guest — the golden's RAM-disk daemon hangs at
+// boot, which also silently kills its self-warming build, so every build ran
+// cold on the virtio disk. The warm pool below pre-boots, mounts the RAM disk on
+// the build root, and pre-warms the page cache, moving all of that off the
+// user's critical path.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -77,6 +81,22 @@ function assertGuestWritableBuildsRoot(): void {
   }
 }
 
+/** Guest build root. Equals BUILDS_ROOT so guest paths match host paths. */
+const GUEST_BUILD_ROOT = BUILDS_ROOT;
+/** RAM disk size for build I/O, in MiB. Backed by the GUEST's memory, so it must
+ *  stay well under VM_MEMORY_MB — the runbook's 8GiB figure assumed a 32GB VM;
+ *  at our 8GB default that would risk OOMing the guest. Pages are allocated
+ *  lazily, but cap it anyway. */
+const RAMDISK_MB = Math.max(
+  512,
+  Math.min(
+    parseInt(process.env.VM_BUILD_RAMDISK_MB ?? '', 10) || 4096,
+    Math.floor(VM_MEMORY_MB / 2),
+  ),
+);
+/** hdiutil takes 512-byte sectors. */
+const RAMDISK_SECTORS = RAMDISK_MB * 2048;
+const WARMUP_TIMEOUT_MS = 5 * 60_000;
 const BOOT_TIMEOUT_MS = 180_000;
 const BUILD_TIMEOUT_MS = 20 * 60_000;
 // NOTE: the guest builds at the SAME absolute path as the host workdir
@@ -211,12 +231,24 @@ async function safeExtract(tgz: string, destDir: string): Promise<boolean> {
 /** Single-quote for safe shell interpolation. */
 const q = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
 
-// ── Slot queue ──────────────────────────────────────────────────────────────
-// A counting semaphore over the VM slots. Kept deliberately simple: builds are
-// short, so FIFO waiting is sufficient and avoids a scheduler.
+// ── Warm VM pool ────────────────────────────────────────────────────────────
+// A build must NOT pay for boot (~10s) or page-cache warm-up (15-70s). The
+// golden image bakes both a RAM disk daemon and a self-warming build for this,
+// but in a fresh clone the RAM-disk daemon hangs at boot, which also kills the
+// warm-up (its script waits for /Volumes/RAMDisk, then fails) — so every build
+// ran fully cold on the virtio disk (~45s vs ~11s bare metal).
+//
+// The pool fixes that by doing BOTH off the user's critical path: VMs are
+// pre-booted, the RAM disk is mounted ON the build root, and the golden's
+// warm-up project is compiled once so the OS page cache is hot. A build then
+// just receives a ready VM. Disposability is unchanged — each VM still serves
+// exactly one build and is destroyed after; the pool tops itself back up.
 
-let inFlight = 0;
-const waiters: Array<() => void> = [];
+interface PooledVm {
+  name: string;
+  ip: string;
+  proc: ChildProcess;
+}
 
 /**
  * Newest build generation per session. A cancelled/superseded handle must never
@@ -225,20 +257,125 @@ const waiters: Array<() => void> = [];
  */
 const sessionGeneration = new Map<string, number>();
 
-async function acquireSlot(onLog: (l: string, s: LogStream) => void): Promise<void> {
-  if (inFlight < SLOTS) {
-    inFlight++;
-    return;
+/** warm + checked-out + currently booting. Must never exceed SLOTS. */
+let liveVms = 0;
+const warmQueue: PooledVm[] = [];
+const vmWaiters: Array<(vm: PooledVm) => void> = [];
+
+/**
+ * Put the guest's build root on a RAM disk. `infra/vm/golden-build.md` measures
+ * this as the dominant build cost on the virtio disk. Mounting AT the build root
+ * (rather than /Volumes/RAMDisk) preserves the guest-path == host-path property
+ * the diagnostics rely on. Best-effort: a failure just means a slower build.
+ */
+async function mountRamDisk(ip: string): Promise<boolean> {
+  const script = [
+    'set -e',
+    `mkdir -p ${GUEST_BUILD_ROOT}`,
+    'if ! diskutil info RAMDisk >/dev/null 2>&1; then',
+    `  DEV=$(hdiutil attach -nomount ram://${RAMDISK_SECTORS} | awk '{print $1}')`,
+    '  [ -z "$DEV" ] && exit 1',
+    '  diskutil erasevolume HFS+ RAMDisk "$DEV" >/dev/null',
+    'fi',
+    'diskutil unmount force RAMDisk >/dev/null 2>&1 || true',
+    `diskutil mount -mountPoint ${GUEST_BUILD_ROOT} RAMDisk >/dev/null`,
+    `mdutil -i off ${GUEST_BUILD_ROOT} >/dev/null 2>&1 || true`,
+    `chmod 1777 ${GUEST_BUILD_ROOT}`,
+  ].join('\n');
+  const res = await execAsync(`${sshBase(ip)} ${q(`sudo bash -c ${JSON.stringify(script)}`)}`, {
+    timeoutMs: 120_000,
+  });
+  if (res.code !== 0) {
+    warn(`ram disk mount failed (build will use the slower virtio disk): ${res.stderr.trim().split('\n')[0]}`);
+    return false;
   }
-  onLog(`Waiting for a build slot (${SLOTS} in use)…`, 'stdout');
-  await new Promise<void>((resolve) => waiters.push(resolve));
-  inFlight++;
+  return true;
 }
 
-function releaseSlot(): void {
-  inFlight = Math.max(0, inFlight - 1);
-  const next = waiters.shift();
-  if (next) next();
+/**
+ * Compile the golden's baked warm-up project so the OS page cache holds the SPM
+ * cache, Xcode and the SDK. The image ships a LaunchAgent for this, but it is
+ * gated on /Volumes/RAMDisk and therefore never runs — we drive it ourselves,
+ * with no user data involved, while the VM is still in the pool.
+ */
+async function warmPageCache(ip: string): Promise<void> {
+  const w = `${GUEST_BUILD_ROOT}/.warmup`;
+  const script = [
+    `[ -d ~/warmup ] || exit 0`,
+    `rm -rf ${w} && mkdir -p ${w} && cp -R ~/warmup/. ${w}/`,
+    `cd ${w}`,
+    `command -v xcodegen >/dev/null 2>&1 && xcodegen generate >/dev/null 2>&1 || true`,
+    `P=$(ls -d ./*.xcodeproj 2>/dev/null | head -1); [ -z "$P" ] && exit 0`,
+    `xcodebuild -project "$P" -scheme "$(basename "$P" .xcodeproj)" -sdk iphonesimulator ` +
+      `-derivedDataPath ./build ONLY_ACTIVE_ARCH=YES ARCHS=arm64 ` +
+      `CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build >/dev/null 2>&1 || true`,
+    `rm -rf ${w}`,
+  ].join('\n');
+  const res = await execAsync(`${sshBase(ip)} ${q(`bash -c ${JSON.stringify(script)}`)}`, {
+    timeoutMs: WARMUP_TIMEOUT_MS,
+  });
+  if (res.code !== 0) warn(`page-cache warm-up did not complete (build may be slower)`);
+}
+
+/** Boot a clone and make it build-ready: RAM disk mounted + page cache warm. */
+async function bootAndWarm(): Promise<PooledVm> {
+  const vm = await bootBuildVm(
+    () => undefined,
+    () => false,
+  );
+  await mountRamDisk(vm.ip);
+  await warmPageCache(vm.ip);
+  log(`build VM ${vm.name} warm and ready`);
+  return { name: vm.name, ip: vm.ip, proc: vm.proc };
+}
+
+/** Fire-and-forget top-up toward SLOTS. Hands a VM straight to a waiter if one
+ *  is queued, else parks it warm. */
+function topUpPool(): void {
+  while (liveVms < SLOTS) {
+    liveVms++;
+    void bootAndWarm().then(
+      (vm) => {
+        const w = vmWaiters.shift();
+        if (w) w(vm);
+        else warmQueue.push(vm);
+      },
+      (e) => {
+        liveVms--;
+        warn(`build VM warm-up failed: ${(e as Error).message}`);
+        // A build may be parked waiting for this VM; without a retry it would
+        // hang forever. Back off so a persistent failure doesn't spin.
+        if (vmWaiters.length > 0) setTimeout(() => topUpPool(), 5_000);
+      },
+    );
+  }
+}
+
+/** Take a ready VM, waiting if all slots are busy. */
+async function checkoutVm(onLog: (l: string, s: LogStream) => void): Promise<PooledVm> {
+  const ready = warmQueue.shift();
+  if (ready) {
+    topUpPool(); // replace it while this build runs
+    return ready;
+  }
+  if (liveVms < SLOTS) {
+    liveVms++;
+    try {
+      return await bootAndWarm();
+    } catch (e) {
+      liveVms--;
+      throw e;
+    }
+  }
+  onLog(`Waiting for a build slot (${SLOTS} in use)…`, 'stdout');
+  return new Promise<PooledVm>((resolve) => vmWaiters.push(resolve));
+}
+
+/** Destroy a used VM (single-use isolation) and replenish the pool. */
+function releaseVm(vm: PooledVm | null): void {
+  if (vm) void destroyVm(vm.name, vm.proc);
+  liveVms = Math.max(0, liveVms - 1);
+  topUpPool();
 }
 
 // ── tart helpers (host side) ────────────────────────────────────────────────
@@ -574,8 +711,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
     const assertOwned = (): void => {
       if (cancelled || superseded()) throw new BuildAborted();
     };
-    await acquireSlot(onLog);
-    let booted: { name: string; ip: string; proc: ChildProcess } | null = null;
+    let booted: PooledVm | null = null;
     const stage = path.join(tmpdir(), `bfvm-${sessionId}-${randomBytes(3).toString('hex')}`);
 
     try {
@@ -588,7 +724,8 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       rmSync(workdir, { recursive: true, force: true });
       mkdirSync(workdir, { recursive: true });
 
-      booted = await bootBuildVm(onLog, () => cancelled);
+      booted = await checkoutVm(onLog);
+      if (cancelled) throw new BuildAborted();
       vm = { name: booted.name, proc: booted.proc };
 
       // 1. Ship the project tarball in.
@@ -839,13 +976,14 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
     } finally {
       // Disposable by construction: the VM is destroyed after every build, so
       // no state (or lingering process) survives to the next tenant.
-      if (booted) await destroyVm(booted.name, booted.proc);
+      // Single-use: the VM is destroyed and the pool replenishes in background,
+      // so teardown never sits on the user's critical path.
+      releaseVm(booted);
       vm = null;
       rmSync(stage, { recursive: true, force: true });
       // Only the current owner clears the entry; a superseded handle must leave
       // the newer build's generation intact.
       if (sessionGeneration.get(sessionId) === myGen) sessionGeneration.delete(sessionId);
-      releaseSlot();
     }
   })();
 
@@ -856,6 +994,44 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
  * Simulator-preview flavor — the original `runBuild` contract, backed by the VM
  * compiler. Kept as a wrapper so the session.ts call site stays backend-agnostic.
  */
+/**
+ * Start filling the warm pool. Called at host-agent startup so the FIRST build
+ * after a restart is also fast; safe to call repeatedly (tops up to SLOTS).
+ */
+export function primeVmBuildPool(): void {
+  if (!BUILDS_ROOT.startsWith('/tmp/')) {
+    warn('vm-queue pool not primed: BUILDS_ROOT is not guest-writable');
+    return;
+  }
+  void reapOrphanedVms().then(() => {
+    log(`priming ${SLOTS} warm build VM(s) (ramdisk ${RAMDISK_MB}MB)…`);
+    topUpPool();
+  });
+}
+
+/**
+ * Destroy build VMs left behind by a previous host-agent process. Without this,
+ * a restart leaks its warm pool and the leftovers consume the 2-guest limit —
+ * every subsequent build then fails with "The number of VMs exceeds the system
+ * limit". Only our own `bfbuild-` clones are touched; golden images are not.
+ */
+async function reapOrphanedVms(): Promise<void> {
+  const listed = await tart(['list', '--format', 'json'], 30_000);
+  if (listed.code !== 0) return;
+  let names: string[] = [];
+  try {
+    names = (JSON.parse(listed.out) as Array<{ Name?: string }>)
+      .map((r) => r.Name ?? '')
+      .filter((n) => n.startsWith('bfbuild-'));
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    warn(`reaping orphaned build VM ${n}`);
+    await destroyVm(n, null);
+  }
+}
+
 export function runVmBuild(options: BuildOptions): BuildHandle {
   const inner = runVmCompile({
     jobId: options.sessionId,
