@@ -25,7 +25,7 @@
 // xcodebuild 8s — i.e. parity with bare metal once a slot is warm.
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { lstatSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -37,11 +37,22 @@ import { extractDiagnostics, sanitize, sanitizeLine } from './build-diagnostics.
 import {
   BUILDS_ROOT,
   BuildAborted,
+  exportOptionsPlist,
   readAppBundleId,
+  unlockSigningKeychain,
+  type AppStoreBuildHandle,
+  type AppStoreBuildOptions,
+  type AppStoreBuildResult,
   type BuildHandle,
   type BuildOptions,
   type BuildResult,
+  type DeviceBuildHandle,
+  type DeviceBuildOptions,
+  type DeviceBuildResult,
 } from './build.js';
+import { ensureSigningAssets } from './asc-signing.js';
+import { normalizeP8, uploadIpaToAppStoreConnect } from './asc-upload.js';
+import { placeholderIcon1024 } from './default-icon.js';
 
 const TART = process.env.TART_BIN ?? '/opt/homebrew/bin/tart';
 const GOLDEN = process.env.VM_BUILD_GOLDEN ?? 'golden-v3';
@@ -91,7 +102,7 @@ function safeAppName(raw: string): string | null {
   // Containment is what matters — enforce it structurally rather than with a
   // narrow charset, since valid PRODUCT_NAMEs include things like
   // "Acme+Beta.app", "Bob's App.app", and non-ASCII names.
-  if (!name.endsWith('.app') || name.length < 5) return null;
+  if (!(name.endsWith('.app') || name.endsWith('.xcarchive')) || name.length < 5) return null;
   if (name.includes('/') || name.includes('\0')) return null;
   if (name === '.' || name === '..' || name.split('/').includes('..')) return null;
   if (path.basename(name) !== name) return null;
@@ -363,8 +374,82 @@ function fetchOverflowed(local: string): boolean {
  * input. Mirrors the flag set the bare-metal backend uses so output is
  * byte-comparable, then tars the .app + .xcresult for extraction.
  */
-function guestBuildScript(scheme: string | undefined, guestWorkdir: string): string {
+/** Which artifact the VM must produce. All three COMPILE untrusted code, so all
+ *  three belong in the guest; only signing stays on the host. */
+export type VmBuildKind = 'sim' | 'device' | 'archive';
+
+export interface VmArchiveMetadata {
+  bundleId: string;
+  marketingVersion: string;
+  buildNumber: string;
+}
+
+function guestBuildScript(
+  scheme: string | undefined,
+  guestWorkdir: string,
+  kind: VmBuildKind,
+  meta?: VmArchiveMetadata,
+): string {
   const schemeArg = scheme ? `SCHEME=${q(scheme)}` : 'SCHEME=""';
+  // Orientation overrides must match the local backend or the preview's rotate
+  // control regresses for apps that don't declare orientations themselves.
+  const orientationFlags = `INFOPLIST_KEY_UIRequiresFullScreen=YES \
+  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
+  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'`;
+  // NOTE: every flavor builds UNSIGNED. The device .ipa is unsigned by design
+  // (the Companion re-signs it with the user's own Apple ID), and the App Store
+  // archive is signed on the HOST at export — putting the distribution private
+  // key inside a VM that runs untrusted build scripts would let those scripts
+  // exfiltrate it.
+  const unsigned = `CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO`;
+  // Xcode 16+ Debug builds otherwise split into a thin launcher + debug dylibs
+  // meant for Xcode's harness; installed standalone they launch and crash.
+  const standalone = `ENABLE_DEBUG_DYLIB=NO ENABLE_PREVIEWS=NO`;
+  // The publish wizard's bundle id / versions must win over the project's own,
+  // or the archive won't match the provisioning profile keyed to signing.bundleId
+  // and the upload carries the wrong version.
+  const publishMeta = meta
+    ? `PRODUCT_BUNDLE_IDENTIFIER=${q(meta.bundleId)} MARKETING_VERSION=${q(meta.marketingVersion)} CURRENT_PROJECT_VERSION=${q(meta.buildNumber)}`
+    : '';
+
+  const invocation =
+    kind === 'archive'
+      ? // App Store: UNSIGNED archive (host signs at export). publishMeta must
+        // win over the project's own identity/version or the archive won't match
+        // the profile keyed to signing.bundleId. No orientation overrides — those
+        // are a simulator-preview concern and would alter the shipped binary.
+        `xcodebuild archive -project "$PROJ" -scheme "$SCHEME" -sdk iphoneos \
+  -destination 'generic/platform=iOS' -archivePath ${q(`${guestWorkdir}/out.xcarchive`)} \
+  -derivedDataPath ./build -resultBundlePath ./result.xcresult \
+  ${unsigned} ${standalone} ${publishMeta}`
+      : kind === 'device'
+        ? // Device .ipa: unsigned (Companion re-signs). `standalone` is required
+          // or Xcode 16+ Debug yields a thin launcher that crashes standalone.
+          `xcodebuild -project "$PROJ" -scheme "$SCHEME" -sdk iphoneos \
+  -destination 'generic/platform=iOS' \
+  -derivedDataPath ./build -resultBundlePath ./result.xcresult \
+  ONLY_ACTIVE_ARCH=NO ${unsigned} ${standalone} build`
+        : // Simulator preview: the only flavor that gets orientation overrides.
+          `xcodebuild -project "$PROJ" -scheme "$SCHEME" -sdk iphonesimulator \
+  -derivedDataPath ./build -resultBundlePath ./result.xcresult \
+  ONLY_ACTIVE_ARCH=YES ARCHS=arm64 ${unsigned} ${orientationFlags} build`;
+
+  // What to hand back: an .app (sim/device) or the whole .xcarchive.
+  const collect =
+    kind === 'archive'
+      ? `if [ -d ${q(`${guestWorkdir}/out.xcarchive`)} ]; then
+  ( cd ${q(guestWorkdir)} && tar czf ~/out-app.tgz out.xcarchive )
+  echo "BF_APP_NAME=out.xcarchive"
+fi`
+      : `PRODUCTS=./build/Build/Products
+# Filter by SDK: an uploaded tarball can carry stale products for the OTHER sdk,
+# and picking those would package/launch the wrong binary.
+APP=$(find "$PRODUCTS" -maxdepth 2 -name '*.app' -path ${kind === 'device' ? "'*-iphoneos/*'" : "'*-iphonesimulator/*'"} 2>/dev/null | head -1)
+if [ -n "$APP" ]; then
+  ( cd "$(dirname "$APP")" && tar czf ~/out-app.tgz "$(basename "$APP")" )
+  echo "BF_APP_NAME=$(basename "$APP")"
+fi`;
+
   return `
 set -o pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -375,31 +460,46 @@ if [ -f project.yml ] && command -v xcodegen >/dev/null 2>&1; then
   xcodegen generate >/dev/null 2>&1 && echo "xcodegen regenerated project from project.yml"
 fi
 # Prefer the project named after the requested scheme (mirrors prepareWorkdir):
-# after a rename, xcodegen leaves the stale .xcodeproj alongside the new one, so
-# a blind "first match" can build the OLD app or miss the scheme entirely.
+# after a rename, xcodegen leaves the stale .xcodeproj alongside the new one.
 PROJ=""
 [ -n "$SCHEME" ] && [ -d "./$SCHEME.xcodeproj" ] && PROJ="./$SCHEME.xcodeproj"
 [ -z "$PROJ" ] && PROJ=$(ls -d ./*.xcodeproj 2>/dev/null | head -1)
 [ -z "$PROJ" ] && { echo "NO_XCODEPROJ" >&2; exit 65; }
 [ -z "$SCHEME" ] && SCHEME=$(basename "$PROJ" .xcodeproj)
-rm -rf result.xcresult
-# Flag set MUST mirror the local-simuser backend: the orientation overrides are
-# what let the injected shim rotate apps that don't declare orientations
-# themselves — omitting them silently breaks the preview's rotate control.
-xcodebuild -project "$PROJ" -scheme "$SCHEME" -sdk iphonesimulator \
-  -derivedDataPath ./build -resultBundlePath ./result.xcresult \
-  ONLY_ACTIVE_ARCH=YES ARCHS=arm64 \
-  CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-  INFOPLIST_KEY_UIRequiresFullScreen=YES \
-  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
-  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
-  build
+# Drop any build products shipped inside the upload so we can never collect a
+# stale artifact instead of what we just compiled.
+rm -rf result.xcresult out.xcarchive build
+${kind === 'archive' ? `# Apple rejects processing without a 1024px icon. Injected in the GUEST: doing
+# it host-side means writing into an untrusted tree, where a symlinked
+# Contents.json would let the project overwrite arbitrary host files. The PNG
+# itself is generated by trusted host code and shipped in as ~/default-icon.png.
+ICONSET=$(find . -type d -name 'AppIcon.appiconset' -not -path '*/build/*' 2>/dev/null | head -1)
+if [ -n "$ICONSET" ] && [ -f ~/default-icon.png ]; then
+  # Mirror ensureAppStoreIcon: an icon counts only if Contents.json REFERENCES a
+  # file that exists (Xcode ignores unreferenced PNGs), so glob-based checks both
+  # skip broken sets and clobber valid ones with unusual extensions.
+  NEED_ICON=1
+  if [ -f "$ICONSET/Contents.json" ]; then
+    # JSON-parse rather than word-split: asset filenames may legally contain
+    # spaces, which shell word splitting would shred into bogus names.
+    if /usr/bin/python3 -c 'import json,os,sys
+d=sys.argv[1]
+try: c=json.load(open(os.path.join(d,"Contents.json")))
+except Exception: sys.exit(1)
+sys.exit(0 if any(i.get("filename") and os.path.isfile(os.path.join(d,i["filename"])) for i in c.get("images",[])) else 1)' "$ICONSET" 2>/dev/null; then
+      NEED_ICON=0
+    fi
+  fi
+  if [ "$NEED_ICON" = "1" ]; then
+    rm -f "$ICONSET/Contents.json"
+    cp ~/default-icon.png "$ICONSET/AppIcon.png"
+    printf '%s\\n' '{ "images": [ { "filename": "AppIcon.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" } ], "info": { "author": "botflow", "version": 1 } }' > "$ICONSET/Contents.json"
+    echo "Icon preflight: added a default app icon (project had none)."
+  fi
+fi` : ''}
+${invocation}
 RC=$?
-APP=$(find ./build/Build/Products -maxdepth 2 -name '*.app' -path '*-iphonesimulator/*' 2>/dev/null | head -1)
-if [ -n "$APP" ]; then
-  ( cd "$(dirname "$APP")" && tar czf ~/out-app.tgz "$(basename "$APP")" )
-  echo "BF_APP_NAME=$(basename "$APP")"
-fi
+${collect}
 [ -d result.xcresult ] && tar czf ~/out-xcresult.tgz result.xcresult
 echo "BF_SCHEME=$SCHEME"
 echo "BF_RC=$RC"
@@ -414,9 +514,40 @@ exit $RC
  * with build.ts's `runBuild`, so the call site can switch on
  * `selectedBuildBackend()` with nothing else changing.
  */
-export function runVmBuild(options: BuildOptions): BuildHandle {
-  const { sessionId, tarballBuf, hints, onLog } = options;
-  const workdir = path.join(BUILDS_ROOT, sessionId);
+export interface VmCompileOptions {
+  /** Stable key for generation ownership (sessionId or buildId). */
+  jobId: string;
+  /** Host workdir; the guest recreates this exact absolute path. */
+  workdir: string;
+  tarballBuf: Buffer;
+  hints?: BuildOptions['hints'];
+  onLog: (line: string, stream: LogStream) => void;
+  kind: VmBuildKind;
+  /** App Store only: publish-wizard identity/version overrides for the archive. */
+  archiveMeta?: VmArchiveMetadata;
+}
+
+export interface VmCompileResult {
+  /** Built .app (sim/device) or .xcarchive (App Store), on the HOST. */
+  artifactPath: string;
+  scheme: string;
+  bundleId: string;
+  durationMs: number;
+  diagnostics: Awaited<ReturnType<typeof extractDiagnostics>>;
+}
+
+export interface VmCompileHandle {
+  done: Promise<VmCompileResult>;
+  cancel: () => void;
+}
+
+/**
+ * Compile ANY build flavor inside a disposable VM. All flavors go through the
+ * same 2-slot queue — Virtualization.framework caps concurrent macOS guests at
+ * 2, so simulator, device and App Store builds contend for the same slots.
+ */
+export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
+  const { jobId: sessionId, workdir, tarballBuf, hints, onLog, kind, archiveMeta } = options;
   let cancelled = false;
   let sshProc: ChildProcess | null = null;
   let vm: { name: string; proc: ChildProcess } | null = null;
@@ -433,7 +564,7 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
     if (vm) void destroyVm(vm.name, vm.proc);
   };
 
-  const done = (async (): Promise<BuildResult> => {
+  const done = (async (): Promise<VmCompileResult> => {
     const startedAt = Date.now();
     assertGuestWritableBuildsRoot();
     const myGen = (sessionGeneration.get(sessionId) ?? 0) + 1;
@@ -485,9 +616,23 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
       }
 
       // 2. Build inside the guest, streaming sanitized output as it goes.
-      const script = guestBuildScript(project.scheme, workdir);
+      const script = guestBuildScript(project.scheme, workdir, kind, archiveMeta);
       const scriptPath = path.join(stage, 'build.sh');
       writeFileSync(scriptPath, script);
+      if (kind === 'archive') {
+        const iconPath = path.join(stage, 'default-icon.png');
+        writeFileSync(iconPath, placeholderIcon1024());
+        const putIcon = await execAsync(scpTo(booted.ip, iconPath, '~/default-icon.png'), {
+          timeoutMs: 60_000,
+        });
+        if (putIcon.code !== 0) {
+          if (cancelled) throw new BuildAborted();
+          // Silently skipping means Apple rejects the upload much later.
+          throw new Error(
+            `sending default app icon failed: ${sanitize(putIcon.stderr.trim(), workdir)}`,
+          );
+        }
+      }
       const putScript = await execAsync(scpTo(booted.ip, scriptPath, '~/build.sh'), {
         timeoutMs: 60_000,
       });
@@ -565,7 +710,23 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
       //    the xcresult exactly as the bare-metal backend does).
       assertOwned();
 
-      let appBundlePath = '';
+      // Publish sources FIRST, then artifacts — so a stale `out.xcarchive` (or
+      // any same-named path) shipped inside the uploaded project can never be
+      // rsynced over the artifact we just built. Sources must also be present
+      // before extractDiagnostics so readSnippet can resolve file paths.
+      // --safe-links drops symlinks pointing outside the tree, and the excludes
+      // stop an upload from occupying the paths we place artifacts at — without
+      // that, a source-controlled symlink at build/Build/Products/... would make
+      // the mkdir/rm/mv below follow it to an attacker-chosen host location.
+      await execAsync(
+        `/usr/bin/rsync -a --safe-links ` +
+          `--exclude=build --exclude=out.xcarchive --exclude=result.xcresult ` +
+          `--exclude=export --exclude=ipa ` +
+          `${q(`${stagedSrc}/`)} ${q(`${workdir}/`)}`,
+        { timeoutMs: 120_000 },
+      ).catch(() => undefined);
+
+      let artifactPath = '';
       if (appName) {
         const appTar = path.join(stage, 'out-app.tgz');
         const got = await execAsync(fetchBounded(booted.ip, '~/out-app.tgz', appTar), {
@@ -582,7 +743,19 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
           mkdirSync(stagedApp, { recursive: true });
           if (await safeExtract(appTar, stagedApp)) {
             assertOwned();
-            const products = path.join(workdir, 'build', 'Build', 'Products', 'Debug-iphonesimulator');
+            // Sim/device .apps live under Products/<config>; the App Store
+            // artifact is a .xcarchive that belongs at the workdir root.
+            const products =
+              kind === 'archive'
+                ? workdir
+                : path.join(workdir, 'build', 'Build', 'Products', 'Debug-iphonesimulator');
+            // Belt-and-braces: never write through a symlink, even if one
+            // somehow reached this path.
+            try {
+              if (lstatSync(products).isSymbolicLink()) rmSync(products, { force: true });
+            } catch {
+              /* absent — fine */
+            }
             mkdirSync(products, { recursive: true });
             // Replace, never merge: untarring over a previous .app would keep
             // files the new build deleted, so the sim would run a hybrid.
@@ -591,7 +764,7 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
               `/bin/mv ${q(path.join(stagedApp, appName))} ${q(products)}`,
               { timeoutMs: 120_000 },
             );
-            if (mv.code === 0) appBundlePath = path.join(products, appName);
+            if (mv.code === 0) artifactPath = path.join(products, appName);
           }
         }
       }
@@ -616,19 +789,11 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
       // extractDiagnostics rewrites paths relative to `workdir`; the xcresult was
       // produced in the guest, so translate the guest dir onto the host one first
       // (same reason as the live log path mapping above).
-      // Publish sources BEFORE parsing diagnostics: readSnippet resolves file
-      // paths under workdir, so without them every snippet would be null (and a
-      // failed build would never reach a later copy step at all).
-      assertOwned();
-      await execAsync(`/usr/bin/rsync -a ${q(`${stagedSrc}/`)} ${q(`${workdir}/`)}`, {
-        timeoutMs: 120_000,
-      }).catch(() => undefined);
-
       // Guest built at this exact path, so xcresult entries already match the
       // host layout — extractDiagnostics needs no translation.
       const diagnostics = await extractDiagnostics(resultBundlePath, workdir).catch(() => []);
 
-      if (rc !== 0 || !appBundlePath) {
+      if (rc !== 0 || !artifactPath) {
         const first = diagnostics.find((d) => d.severity === 'error');
         const err = new Error(first?.message ?? `build failed in VM (exit ${rc ?? 'unknown'})`);
         // Session.runBuildAndLaunch only forwards diagnostics carried on the
@@ -645,18 +810,27 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
       // handle resolve and install its app over the replacement build's.
       assertOwned();
 
-      const scheme = guestScheme || path.basename(appBundlePath, '.app');
+      const scheme = guestScheme || path.basename(artifactPath).replace(/\.(app|xcarchive)$/, '');
       // Authoritative bundle id comes from the BUILT app, not the upload hint:
       // the hint is optional (empty => `simctl launch` with no id) and can be
       // stale (=> launching the wrong app). Matches the local backend.
-      const bundleId = (await readAppBundleId(appBundlePath).catch(() => null)) ?? project.bundleId ?? '';
-      if (!bundleId) {
-        throw new Error('could not determine bundle id from the built .app');
-      }
-      log(`vm build ok: scheme=${scheme} app=${appBundlePath} in ${Date.now() - startedAt}ms`);
+      // Authoritative bundle id from the BUILT product (the hint is optional and
+      // can be stale). For an archive the app sits inside Products/Applications.
+      const appForId =
+        kind === 'archive'
+          ? (await execAsync(
+              `ls -d ${q(path.join(artifactPath, 'Products', 'Applications'))}/*.app 2>/dev/null | head -1`,
+            )).stdout.trim()
+          : artifactPath;
+      const bundleId =
+        (appForId ? await readAppBundleId(appForId).catch(() => null) : null) ??
+        project.bundleId ??
+        '';
+      if (!bundleId) throw new Error('could not determine bundle id from the built product');
+      log(`vm ${kind} build ok: scheme=${scheme} artifact=${artifactPath} in ${Date.now() - startedAt}ms`);
 
       return {
-        appBundlePath,
+        artifactPath,
         scheme,
         bundleId,
         durationMs: Date.now() - startedAt,
@@ -674,6 +848,221 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
       releaseSlot();
     }
   })();
+
+  return { done, cancel };
+}
+
+/**
+ * Simulator-preview flavor — the original `runBuild` contract, backed by the VM
+ * compiler. Kept as a wrapper so the session.ts call site stays backend-agnostic.
+ */
+export function runVmBuild(options: BuildOptions): BuildHandle {
+  const inner = runVmCompile({
+    jobId: options.sessionId,
+    workdir: path.join(BUILDS_ROOT, options.sessionId),
+    tarballBuf: options.tarballBuf,
+    hints: options.hints,
+    onLog: options.onLog,
+    kind: 'sim',
+  });
+  const done = inner.done.then(
+    (r): BuildResult => ({
+      appBundlePath: r.artifactPath,
+      scheme: r.scheme,
+      bundleId: r.bundleId,
+      durationMs: r.durationMs,
+      diagnostics: r.diagnostics,
+    }),
+  );
+  return { done, cancel: inner.cancel };
+}
+
+/**
+ * Device `.ipa` flavor. The build is UNSIGNED by design (the Botflow Companion
+ * re-signs locally with the user's own Apple ID), so the entire thing — compile
+ * included — runs in the VM and nothing sensitive is involved. The host only
+ * repackages the returned .app into an IPA.
+ */
+export function runVmDeviceBuild(options: DeviceBuildOptions): DeviceBuildHandle {
+  const { buildId, tarballBuf, hints, onLog = () => undefined } = options;
+  const workdir = path.join(BUILDS_ROOT, `device-${buildId}`);
+  const inner = runVmCompile({
+    jobId: `device-${buildId}`,
+    workdir,
+    tarballBuf,
+    hints,
+    onLog,
+    kind: 'device',
+  });
+
+  const done = (async (): Promise<DeviceBuildResult> => {
+    const r = await inner.done;
+    // Package Payload/<App>.app -> .ipa. Keep the bundle's real name inside
+    // Payload/ — renaming to the scheme yields a malformed IPA when
+    // PRODUCT_NAME differs from the scheme.
+    const ipaRoot = path.join(workdir, 'ipa');
+    const payloadDir = path.join(ipaRoot, 'Payload');
+    rmSync(ipaRoot, { recursive: true, force: true });
+    mkdirSync(payloadDir, { recursive: true });
+    const copy = await execAsync(
+      `/usr/bin/ditto ${q(r.artifactPath)} ${q(path.join(payloadDir, path.basename(r.artifactPath)))}`,
+      { timeoutMs: 120_000 },
+    );
+    if (copy.code !== 0) throw new Error(`ditto app copy failed: ${sanitize(copy.stderr, workdir)}`);
+
+    const ipaPath = path.join(workdir, `${r.scheme}.ipa`);
+    const zip = await execAsync(
+      `/usr/bin/ditto -c -k --norsrc --keepParent "Payload" ${q(ipaPath)}`,
+      { timeoutMs: 120_000, cwd: ipaRoot },
+    );
+    if (zip.code !== 0) throw new Error(`IPA packaging failed: ${sanitize(zip.stderr, workdir)}`);
+
+    return {
+      ipaPath,
+      appBundlePath: r.artifactPath,
+      scheme: r.scheme,
+      bundleId: r.bundleId,
+      durationMs: r.durationMs,
+      diagnostics: r.diagnostics,
+      unsigned: true,
+    };
+  })();
+
+  return { done, cancel: inner.cancel };
+}
+
+/**
+ * App Store flavor. SPLIT BY TRUST: the archive is built UNSIGNED inside the VM
+ * (it compiles untrusted code), then signed + exported + uploaded on the HOST.
+ * The distribution private key therefore never enters a VM running attacker
+ * -controlled build scripts — which is the whole point of the boundary.
+ */
+export function runVmAppStoreBuild(options: AppStoreBuildOptions): AppStoreBuildHandle {
+  const {
+    buildId,
+    tarballBuf,
+    signing,
+    hints,
+    onLog = () => undefined,
+    onPhase = () => undefined,
+  } = options;
+  const workdir = path.join(BUILDS_ROOT, `appstore-${buildId}`);
+  let cancelled = false;
+  let innerCancel: (() => void) | null = null;
+  const cancel = (): void => {
+    cancelled = true;
+    innerCancel?.();
+  };
+
+  // TRUSTED scratch: never contains uploaded entries, so host-side writes
+  // (ExportOptions.plist, cert/CSR material) cannot be redirected by a symlink
+  // planted in the project archive — the uploaded tree is rsynced into workdir.
+  const trusted = path.join(tmpdir(), `bfassign-${buildId}-${randomBytes(3).toString('hex')}`);
+
+  const done = (async (): Promise<AppStoreBuildResult> => {
+    const startedAt = Date.now();
+    mkdirSync(trusted, { recursive: true });
+    const keychain = process.env.SIGNING_KEYCHAIN;
+    const keychainPassword = process.env.SIGNING_KEYCHAIN_PASSWORD;
+    if (!keychain || !keychainPassword) {
+      throw new Error(
+        'App Store signing requires SIGNING_KEYCHAIN and SIGNING_KEYCHAIN_PASSWORD ' +
+          'to be set in the host-agent environment.',
+      );
+    }
+
+    if (cancelled) throw new BuildAborted();
+
+    // ── Compile + archive (UNSIGNED) inside the VM ──
+    const inner = runVmCompile({
+      jobId: `appstore-${buildId}`,
+      workdir,
+      tarballBuf,
+      hints,
+      onLog,
+      kind: 'archive',
+      archiveMeta: {
+        bundleId: signing.bundleId,
+        marketingVersion: signing.marketingVersion,
+        buildNumber: signing.buildNumber,
+      },
+    });
+    innerCancel = inner.cancel;
+    const r = await inner.done;
+    const archivePath = r.artifactPath;
+    if (cancelled) throw new BuildAborted();
+
+    // ── Sign + export on the HOST (keychain never leaves it) ──
+    onPhase('exporting');
+    const p8 = normalizeP8(Buffer.from(signing.p8Base64, 'base64').toString('utf8'));
+    const auth = { keyId: signing.keyId, issuerId: signing.issuerId, p8 };
+    await unlockSigningKeychain(onLog);
+    const { signingIdentity, profileName } = await ensureSigningAssets({
+      auth,
+      teamId: signing.teamId,
+      bundleId: signing.bundleId,
+      appName: r.scheme,
+      keychain,
+      keychainPassword,
+      // Cert/CSR scratch (dist.key, dist.p12, …) also goes to trusted scratch.
+      workdir: trusted,
+      onLog,
+    });
+
+    const exportPath = path.join(trusted, 'export');
+    const exportPlist = path.join(trusted, 'ExportOptions.plist');
+    writeFileSync(
+      exportPlist,
+      exportOptionsPlist(signing.teamId, signing.bundleId, profileName, signingIdentity),
+    );
+    // Re-unlock immediately before export: codesign runs again here and a
+    // re-locked keychain fails the re-sign silently.
+    await unlockSigningKeychain(onLog);
+    const exported = await execAsync(
+      `/usr/bin/xcodebuild -exportArchive -archivePath ${q(archivePath)} ` +
+        `-exportPath ${q(exportPath)} -exportOptionsPlist ${q(exportPlist)} ` +
+        `OTHER_CODE_SIGN_FLAGS=--keychain\\ ${q(keychain)}`,
+      { timeoutMs: 20 * 60_000, cwd: trusted },
+    );
+    for (const line of `${exported.stdout}${exported.stderr}`.split('\n')) {
+      const clean = sanitizeLine(line, workdir);
+      if (clean) onLog(clean, 'stdout');
+    }
+    if (exported.code !== 0) {
+      throw new Error(`xcodebuild -exportArchive exited ${exported.code}`);
+    }
+    if (cancelled) throw new BuildAborted();
+
+    const ipaGlob = await execAsync(`ls ${q(exportPath)}/*.ipa 2>/dev/null | head -1`);
+    const ipaPath = ipaGlob.stdout.trim();
+    if (!ipaPath) throw new Error('Export succeeded but no .ipa was produced');
+
+    // ── Upload ──
+    onPhase('uploading');
+    const uploadResult = await uploadIpaToAppStoreConnect({
+      auth,
+      ascAppId: signing.ascAppId,
+      ipaPath,
+      cfBundleVersion: signing.buildNumber,
+      cfBundleShortVersionString: signing.marketingVersion,
+      onLog: (line) => onLog(line, 'stdout'),
+    });
+
+    return {
+      scheme: r.scheme,
+      bundleId: signing.bundleId,
+      marketingVersion: signing.marketingVersion,
+      buildNumber: signing.buildNumber,
+      durationMs: Date.now() - startedAt,
+      diagnostics: r.diagnostics,
+      buildUploadId: uploadResult.buildUploadId,
+      uploadState: uploadResult.state,
+    };
+  })().finally(() => {
+    // Holds the exported .ipa + cert scratch; without this every publish leaks
+    // a full IPA outside BUILDS_ROOT.
+    rmSync(trusted, { recursive: true, force: true });
+  });
 
   return { done, cancel };
 }

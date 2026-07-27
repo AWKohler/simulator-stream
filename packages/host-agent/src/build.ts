@@ -577,7 +577,7 @@ export interface AppStoreBuildHandle {
  * <keychain>` after the cert is first created, or codesign hangs on a GUI
  * permission dialog nothing can click.
  */
-async function unlockSigningKeychain(
+export async function unlockSigningKeychain(
   onLog: (line: string, stream: LogStream) => void,
 ): Promise<void> {
   const kc = process.env.SIGNING_KEYCHAIN;
@@ -823,7 +823,7 @@ export function runAppStoreBuild(options: AppStoreBuildOptions): AppStoreBuildHa
   return { done, cancel };
 }
 
-function exportOptionsPlist(
+export function exportOptionsPlist(
   teamId: string,
   bundleId: string,
   profileName: string,

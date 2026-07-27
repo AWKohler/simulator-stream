@@ -16,6 +16,8 @@ import { detect, hasIDB, stopAllCompanions } from './idb.js';
 import { ensureCompiled } from './capturer.js';
 import { ensureFramebufferCapturer } from './framebuffer-capturer.js';
 import { runAppStoreBuild, runDeviceBuild, type AppStoreSigningInput } from './build.js';
+import { selectedBuildBackend } from './build-runner.js';
+import { runVmAppStoreBuild, runVmDeviceBuild } from './vm-build-runner.js';
 import { ControllerClient, type ControllerToHostCmd } from './controller-client.js';
 import { log, warn } from './log.js';
 
@@ -276,7 +278,9 @@ async function main(): Promise<void> {
 
     const tarballBuf = Buffer.from(tarballBase64, 'base64');
     try {
-      const build = runDeviceBuild({
+      const startDeviceBuild =
+        selectedBuildBackend() === 'vm-queue' ? runVmDeviceBuild : runDeviceBuild;
+      const build = startDeviceBuild({
         buildId,
         tarballBuf,
         hints,
@@ -332,7 +336,9 @@ async function main(): Promise<void> {
 
     const tarballBuf = Buffer.from(tarballBase64, 'base64');
     try {
-      const build = runAppStoreBuild({
+      const startAppStoreBuild =
+        selectedBuildBackend() === 'vm-queue' ? runVmAppStoreBuild : runAppStoreBuild;
+      const build = startAppStoreBuild({
         buildId,
         tarballBuf,
         signing,

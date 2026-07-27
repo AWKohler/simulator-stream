@@ -26,7 +26,7 @@ function crc32(buf: Buffer): number {
 /** A 1024×1024 opaque RGB PNG (no alpha — App Store requires it) with a subtle
  *  indigo→violet diagonal gradient. Generated at runtime so we don't carry a
  *  ~30 KB base64 literal. */
-function placeholderIcon1024(): Buffer {
+export function placeholderIcon1024(): Buffer {
   const size = 1024;
   const a = [79, 70, 229]; // #4F46E5
   const b = [124, 58, 237]; // #7C3AED

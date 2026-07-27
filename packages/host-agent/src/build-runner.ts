@@ -19,13 +19,17 @@
 //      code under the firewalled sim user instead of the privileged orchestrator
 //      — acceptable as a stopgap, but NOT a hard boundary (same uid as the sims).
 //
-//  • 'vm-queue' (END STATE, not yet implemented):
-//      Submit the project tarball to a build slot (one of the 2 VMs), which runs
-//      the entire build inside the VM and returns the built bundle bytes; the
-//      host writes them to a local path for the sim user to install. Jobs beyond
-//      the 2 live slots wait in a software queue (builds are short, so it drains
-//      fast). This is the hard-isolation answer and the reason builds and sim
-//      RUNTIME are deliberately kept on separate code paths.
+//  • 'vm-queue' (IMPLEMENTED — vm-build-runner.ts):
+//      Every flavor compiles inside a disposable VM cloned from the golden
+//      image, and only the built artifact comes back. ALL THREE contend for the
+//      same 2 slots; jobs beyond that wait in a FIFO queue (builds are ~8s, so
+//      it drains fast). Sims still run on bare metal as `simhost` — it is only
+//      COMPILATION that moves into the VM, which is why builds and sim RUNTIME
+//      are deliberately separate code paths.
+//        - sim / device: built entirely in the guest (both are unsigned).
+//        - App Store: archived UNSIGNED in the guest, then signed + exported +
+//          uploaded on the HOST, so the distribution private key never enters a
+//          VM that runs untrusted build scripts.
 //
 // ── Contract a build executor must satisfy ──────────────────────────────────
 //   build(tarball, hints, onLog) -> {
@@ -36,38 +40,33 @@
 //   ...streaming sanitized log lines via onLog as it goes, and exposing a
 //   cancel() so a stale build can be killed when the user hits Refresh.
 //
-// build.ts implements that contract for 'local-simuser' today. When the VM queue
-// lands, add a VmQueueBuildRunner satisfying the same contract and switch on
-// selectedBuildBackend() at the runBuild call site — nothing else changes.
+// build.ts implements that contract for 'local-simuser'; vm-build-runner.ts
+// implements it for 'vm-queue'. Call sites switch on selectedBuildBackend().
 
 export type BuildBackend = 'local-simuser' | 'vm-queue';
 
 /**
- * Which build backend is active. 'vm-queue' once a queue endpoint is configured
- * (VM_BUILD_QUEUE_URL); 'local-simuser' otherwise. The vm-queue backend is not
- * implemented yet — this selector is the guard that will route to it.
+ * Which build backend is active: 'vm-queue' when VM_BUILD_QUEUE_URL is set,
+ * 'local-simuser' otherwise. Call sites (session.ts, index.ts) switch on this.
  */
 export function selectedBuildBackend(): BuildBackend {
   return process.env.VM_BUILD_QUEUE_URL ? 'vm-queue' : 'local-simuser';
 }
 
-/** Throw if a backend is selected that isn't implemented yet, with a clear msg. */
 /**
- * Guard for BARE-METAL build entry points.
+ * Defensive guard for the BARE-METAL build entry points.
  *
- * The simulator-preview flavor now has a VM implementation (vm-build-runner.ts)
- * and is routed by the call site in session.ts. The device `.ipa` and App Store
- * flavors do NOT yet run in a VM. If they silently fell through to bare metal
- * while `VM_BUILD_QUEUE_URL` is set, the operator would believe untrusted
- * compilation is isolated when it is not — and the App Store flavor runs on the
- * very host that holds the signing keychain. Fail loudly instead.
+ * All three flavors (simulator preview, device .ipa, App Store) now have a VM
+ * implementation and are routed by their call sites. Reaching a local entry
+ * point while `VM_BUILD_QUEUE_URL` is set therefore means a routing bug — and
+ * silently compiling untrusted input on bare metal (beside the signing
+ * keychain) is exactly what this backend exists to prevent. Fail loudly.
  */
 export function assertLocalBackendAllowed(flavor: string): void {
   if (selectedBuildBackend() === 'vm-queue') {
     throw new Error(
-      `${flavor} builds have no vm-queue implementation yet, but VM_BUILD_QUEUE_URL is set. ` +
-        `Refusing to compile untrusted input on bare metal while VM isolation is expected. ` +
-        `Unset VM_BUILD_QUEUE_URL to permit local builds, or implement the VM path for ${flavor}.`,
+      `${flavor} build reached the bare-metal path while VM_BUILD_QUEUE_URL is set — ` +
+        `routing bug. Refusing to compile untrusted input outside the VM.`,
     );
   }
 }
