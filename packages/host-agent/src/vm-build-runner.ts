@@ -263,6 +263,38 @@ const warmQueue: PooledVm[] = [];
 const vmWaiters: Array<(vm: PooledVm) => void> = [];
 
 /**
+ * Run a multi-line script in the guest by SHIPPING IT AS A FILE.
+ *
+ * Do NOT use `ssh host bash -c "<script>"`: the newlines collapse (a `\n` inside
+ * double quotes is a literal backslash-n), so the whole script becomes one
+ * nonsense command. That silently broke the RAM-disk mount and the page-cache
+ * warm-up — the VM still reported "ready" while being neither.
+ */
+async function runGuestScript(
+  ip: string,
+  script: string,
+  label: string,
+  opts: { sudo?: boolean; timeoutMs: number },
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const local = path.join(tmpdir(), `bfguest-${label}-${randomBytes(4).toString('hex')}.sh`);
+  const remote = `~/.bf-${label}.sh`;
+  try {
+    writeFileSync(local, script.endsWith('\n') ? script : `${script}\n`);
+    const put = await execAsync(scpTo(ip, local, remote), { timeoutMs: 60_000 });
+    if (put.code !== 0) {
+      return { code: put.code ?? 1, stdout: put.stdout, stderr: put.stderr };
+    }
+    const run = await execAsync(
+      `${sshBase(ip)} ${q(`${opts.sudo ? 'sudo ' : ''}bash ${remote}`)}`,
+      { timeoutMs: opts.timeoutMs },
+    );
+    return { code: run.code ?? 1, stdout: run.stdout, stderr: run.stderr };
+  } finally {
+    rmSync(local, { force: true });
+  }
+}
+
+/**
  * Put the guest's build root on a RAM disk. `infra/vm/golden-build.md` measures
  * this as the dominant build cost on the virtio disk. Mounting AT the build root
  * (rather than /Volumes/RAMDisk) preserves the guest-path == host-path property
@@ -282,11 +314,12 @@ async function mountRamDisk(ip: string): Promise<boolean> {
     `mdutil -i off ${GUEST_BUILD_ROOT} >/dev/null 2>&1 || true`,
     `chmod 1777 ${GUEST_BUILD_ROOT}`,
   ].join('\n');
-  const res = await execAsync(`${sshBase(ip)} ${q(`sudo bash -c ${JSON.stringify(script)}`)}`, {
-    timeoutMs: 120_000,
-  });
+  const res = await runGuestScript(ip, script, 'ramdisk', { sudo: true, timeoutMs: 120_000 });
   if (res.code !== 0) {
-    warn(`ram disk mount failed (build will use the slower virtio disk): ${res.stderr.trim().split('\n')[0]}`);
+    warn(
+      `ram disk mount failed (build will use the slower virtio disk): ` +
+        `${(res.stderr || res.stdout).trim().split('\n')[0]}`,
+    );
     return false;
   }
   return true;
@@ -311,21 +344,38 @@ async function warmPageCache(ip: string): Promise<void> {
       `CODE_SIGN_IDENTITY= CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build >/dev/null 2>&1 || true`,
     `rm -rf ${w}`,
   ].join('\n');
-  const res = await execAsync(`${sshBase(ip)} ${q(`bash -c ${JSON.stringify(script)}`)}`, {
-    timeoutMs: WARMUP_TIMEOUT_MS,
-  });
-  if (res.code !== 0) warn(`page-cache warm-up did not complete (build may be slower)`);
+  const res = await runGuestScript(ip, script, 'warmup', { timeoutMs: WARMUP_TIMEOUT_MS });
+  if (res.code !== 0) {
+    warn(
+      `page-cache warm-up did not complete (build may be slower): ` +
+        `${(res.stderr || res.stdout).trim().split('\n')[0]}`,
+    );
+  }
 }
 
 /** Boot a clone and make it build-ready: RAM disk mounted + page cache warm. */
 async function bootAndWarm(): Promise<PooledVm> {
+  const t0 = Date.now();
   const vm = await bootBuildVm(
     () => undefined,
     () => false,
   );
+  const booted = Date.now();
   await mountRamDisk(vm.ip);
+  // Trust the filesystem, not the exit code: a silently-degraded mount is how
+  // the first attempt shipped "warm" VMs that were neither ram-backed nor warm.
+  const df = await execAsync(
+    `${sshBase(vm.ip)} ${q(`df -k ${GUEST_BUILD_ROOT} | tail -1`)}`,
+    { timeoutMs: 30_000 },
+  );
+  const onRam = /\/dev\/disk/.test(df.stdout) && !/Volumes\/Data/.test(df.stdout);
+  const mounted = Date.now();
   await warmPageCache(vm.ip);
-  log(`build VM ${vm.name} warm and ready`);
+  log(
+    `build VM ${vm.name} ready: boot ${((booted - t0) / 1000).toFixed(1)}s, ` +
+      `ramdisk ${((mounted - booted) / 1000).toFixed(1)}s (${onRam ? 'ON RAM' : 'NOT ram-backed'}), ` +
+      `warmup ${((Date.now() - mounted) / 1000).toFixed(1)}s`,
+  );
   return { name: vm.name, ip: vm.ip, proc: vm.proc };
 }
 
@@ -724,7 +774,9 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       rmSync(workdir, { recursive: true, force: true });
       mkdirSync(workdir, { recursive: true });
 
+      const tCheckout = Date.now();
       booted = await checkoutVm(onLog);
+      const tGotVm = Date.now();
       if (cancelled) throw new BuildAborted();
       vm = { name: booted.name, proc: booted.proc };
 
@@ -781,6 +833,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       // Separate buffers: stdout and stderr are independent streams, so a shared
       // tail would splice a half-line from one onto the next chunk of the other,
       // corrupting logs and potentially hiding a BF_* control marker.
+      const tXfer = Date.now();
       let outTail = '';
       let errTail = '';
       let guestScheme = hints?.scheme ?? '';
@@ -842,6 +895,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       });
 
       if (cancelled) throw new BuildAborted();
+      const tCompiled = Date.now();
 
       // 3. Bring back the .app and the .xcresult (diagnostics are parsed from
       //    the xcresult exactly as the bare-metal backend does).
@@ -964,7 +1018,15 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
         project.bundleId ??
         '';
       if (!bundleId) throw new Error('could not determine bundle id from the built product');
-      log(`vm ${kind} build ok: scheme=${scheme} artifact=${artifactPath} in ${Date.now() - startedAt}ms`);
+      // Phase breakdown: without this a slow/stuck build is a black box. (The
+      // first pool attempt looked "warm" while silently building cold on disk.)
+      log(
+        `vm ${kind} build ok: scheme=${scheme} in ${Date.now() - startedAt}ms ` +
+          `[vm-wait ${((tGotVm - tCheckout) / 1000).toFixed(1)}s, ` +
+          `transfer ${((tXfer - tGotVm) / 1000).toFixed(1)}s, ` +
+          `compile ${((tCompiled - tXfer) / 1000).toFixed(1)}s, ` +
+          `artifacts ${((Date.now() - tCompiled) / 1000).toFixed(1)}s] ${artifactPath}`,
+      );
 
       return {
         artifactPath,
