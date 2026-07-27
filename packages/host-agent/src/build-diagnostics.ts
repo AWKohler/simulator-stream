@@ -2,7 +2,7 @@
 // BEFORE anything crosses the wire — the hard requirement is that no absolute
 // host path, session id, Xcode path, or device UDID ever leaves the Mac.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { BuildDiagnostic } from '@sim/shared';
 import { execAsync } from './util.js';
@@ -212,8 +212,18 @@ function readSnippet(
   sanitizeWorkdir: string,
 ): string[] | null {
   try {
-    const abs = path.join(workdir, projectRelFile);
-    const lines = readFileSync(abs, 'utf8').split('\n');
+    // CONTAINMENT: the file path comes from the .xcresult, which is produced by
+    // an untrusted build (and, under the vm-queue backend, is fully
+    // attacker-controlled). A path like `../../../etc/passwd` would otherwise
+    // make us read and return arbitrary host-readable files — defeating the VM
+    // isolation boundary. Resolve and require the result to stay under workdir.
+    // realpath BOTH sides: a lexical check alone is bypassable by a symlink
+    // planted inside the workdir by the uploaded archive (readFileSync would
+    // happily follow it out to /etc/passwd).
+    const root = realpathSync(path.resolve(workdir));
+    const real = realpathSync(path.resolve(root, projectRelFile));
+    if (real !== root && !real.startsWith(root + path.sep)) return null;
+    const lines = readFileSync(real, 'utf8').split('\n');
     const start = Math.max(0, line - 3);
     const end = Math.min(lines.length, line + 2);
     return lines

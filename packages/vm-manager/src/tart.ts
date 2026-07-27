@@ -13,9 +13,9 @@ export interface TartVM {
 }
 
 export interface TartRunOptions {
-  /** Memory cap for the VM, in MB. Maps to `tart run --memory`. */
+  /** Memory cap for the VM, in MB. Applied via `tart set` (see tartRun). */
   memoryMB: number;
-  /** vCPU count. Maps to `tart run --cpu`. */
+  /** vCPU count. Applied via `tart set` (see tartRun). */
   cpu: number;
   /** When true, runs without an attached graphical window (headless). */
   noGraphics?: boolean;
@@ -23,6 +23,23 @@ export interface TartRunOptions {
    * tag, value = host directory. Used to inject per-VM secrets (e.g. the
    * Tailscale authkey) without baking them into the golden image. */
   mounts?: Record<string, string>;
+  /**
+   * Run the VM behind tart's Softnet software networking instead of the shared
+   * NAT. This is what makes a build VM's egress restrictable at the VM
+   * boundary: combined with `netAllow`, the guest can only reach the listed
+   * CIDRs. Untrusted compilation (Package.swift / SwiftPM plugins / Run Script
+   * phases) therefore cannot reach the host's control plane, the tailnet, or
+   * the home LAN even if it fully owns the guest.
+   */
+  netSoftnet?: boolean;
+  /**
+   * CIDRs the guest may reach, as `--net-softnet-allow`. Only meaningful with
+   * `netSoftnet`. Empty/undefined leaves Softnet's default policy in place.
+   */
+  netAllow?: string[];
+  /** CIDRs the guest may NOT reach, as `--net-softnet-block`. Longest prefix
+   *  match wins when combined with `netAllow`. */
+  netBlock?: string[];
 }
 
 interface ExecResult {
@@ -94,8 +111,29 @@ export function tartRun(
   name: string,
   options: TartRunOptions,
 ): { pid: number; kill: (signal?: NodeJS.Signals) => void } | null {
-  const args = ['run', name, '--memory', String(options.memoryMB), '--cpu', String(options.cpu)];
+  // tart 2.x moved --memory/--cpu OFF `tart run` and onto `tart set`; passing
+  // them to `run` is a hard "Unknown option" failure. Apply them as a separate
+  // configure step first (idempotent, persisted on the VM), then boot.
+  const cfg = execSync('tart', [
+    'set',
+    name,
+    '--memory',
+    String(options.memoryMB),
+    '--cpu',
+    String(options.cpu),
+  ]);
+  if (cfg.code !== 0) {
+    warn(`tart set ${name} (mem=${options.memoryMB} cpu=${options.cpu}) failed: ${cfg.stderr.trim()}`);
+    return null;
+  }
+
+  const args = ['run', name];
   if (options.noGraphics) args.push('--no-graphics');
+  if (options.netSoftnet) {
+    args.push('--net-softnet');
+    if (options.netAllow?.length) args.push(`--net-softnet-allow=${options.netAllow.join(',')}`);
+    if (options.netBlock?.length) args.push(`--net-softnet-block=${options.netBlock.join(',')}`);
+  }
   if (options.mounts) {
     for (const [tag, hostPath] of Object.entries(options.mounts)) {
       // `--dir <tag>:<host-path>` shares a host directory into the guest at

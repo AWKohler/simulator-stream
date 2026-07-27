@@ -47,6 +47,8 @@ import {
   type BuildHandle,
   type LaunchCameraInjection,
 } from './build.js';
+import { selectedBuildBackend } from './build-runner.js';
+import { runVmBuild } from './vm-build-runner.js';
 import {
   probeDeviceFromScreenshot,
   startSimctlCapturer,
@@ -384,7 +386,12 @@ export class Session extends EventEmitter {
     // Workdir mirrors what runBuild constructs; needed to feed the live regex
     // parser the same path-rewrite context the sanitizer uses.
     const buildWorkdir = path.join(BUILDS_ROOT, this.sessionId);
-    const handle = runBuild({
+    // Backend switch (see build-runner.ts). 'vm-queue' compiles inside a
+    // disposable VM — the only place untrusted xcodegen/xcodebuild should run;
+    // 'local-simuser' is the bare-metal interim. Both satisfy the same contract,
+    // so everything below is backend-agnostic.
+    const startBuild = selectedBuildBackend() === 'vm-queue' ? runVmBuild : runBuild;
+    const handle = startBuild({
       sessionId: this.sessionId,
       tarballBuf,
       hints,

@@ -8,7 +8,7 @@ import { ensureOrientationShim } from './orientation-shim.js';
 import { log, warn } from './log.js';
 import { parseProjectYml, type ProjectInfo } from './project-yml.js';
 import { extractDiagnostics, sanitizeLine } from './build-diagnostics.js';
-import { assertBuildBackendReady } from './build-runner.js';
+import { assertLocalBackendAllowed } from './build-runner.js';
 import { normalizeP8, uploadIpaToAppStoreConnect } from './asc-upload.js';
 import { ensureSigningAssets } from './asc-signing.js';
 import { ensureAppStoreIcon } from './default-icon.js';
@@ -215,7 +215,7 @@ export interface DeviceBuildHandle {
 // routes to it. Until then, building with VM_BUILD_QUEUE_URL set is an error
 // rather than a silent fallback to bare-metal.
 export function runBuild(options: BuildOptions): BuildHandle {
-  assertBuildBackendReady();
+  assertLocalBackendAllowed('simulator preview');
   const { sessionId, tarballBuf, hints, onLog } = options;
   const workdir = path.join(BUILDS_ROOT, sessionId);
   let proc: ChildProcess | null = null;
@@ -373,6 +373,7 @@ export function runBuild(options: BuildOptions): BuildHandle {
  * AltSign/AltServer will replace signing assets locally before device install.
  */
 export function runDeviceBuild(options: DeviceBuildOptions): DeviceBuildHandle {
+  assertLocalBackendAllowed('device .ipa');
   const { buildId, tarballBuf, hints, onLog = () => undefined } = options;
   const workdir = path.join(BUILDS_ROOT, `device-${buildId}`);
   let proc: ChildProcess | null = null;
@@ -620,6 +621,7 @@ async function unlockSigningKeychain(
  * is polled platform-side afterward via the ASC API.
  */
 export function runAppStoreBuild(options: AppStoreBuildOptions): AppStoreBuildHandle {
+  assertLocalBackendAllowed('App Store');
   const {
     buildId,
     tarballBuf,
@@ -862,7 +864,7 @@ function exportOptionsPlist(
  * Handles both binary and XML plist formats. Returns null on any failure
  * (caller falls back to whatever bundleId it parsed from project.yml).
  */
-async function readAppBundleId(appBundlePath: string): Promise<string | null> {
+export async function readAppBundleId(appBundlePath: string): Promise<string | null> {
   const plist = path.join(appBundlePath, 'Info.plist');
   if (!existsSync(plist)) return null;
   const res = await execAsync(

@@ -52,11 +52,22 @@ export function selectedBuildBackend(): BuildBackend {
 }
 
 /** Throw if a backend is selected that isn't implemented yet, with a clear msg. */
-export function assertBuildBackendReady(): void {
+/**
+ * Guard for BARE-METAL build entry points.
+ *
+ * The simulator-preview flavor now has a VM implementation (vm-build-runner.ts)
+ * and is routed by the call site in session.ts. The device `.ipa` and App Store
+ * flavors do NOT yet run in a VM. If they silently fell through to bare metal
+ * while `VM_BUILD_QUEUE_URL` is set, the operator would believe untrusted
+ * compilation is isolated when it is not — and the App Store flavor runs on the
+ * very host that holds the signing keychain. Fail loudly instead.
+ */
+export function assertLocalBackendAllowed(flavor: string): void {
   if (selectedBuildBackend() === 'vm-queue') {
     throw new Error(
-      'VM_BUILD_QUEUE_URL is set but the vm-queue build backend is not implemented yet. ' +
-        'Unset it to use the local-simuser backend, or implement VmQueueBuildRunner (see build-runner.ts).',
+      `${flavor} builds have no vm-queue implementation yet, but VM_BUILD_QUEUE_URL is set. ` +
+        `Refusing to compile untrusted input on bare metal while VM isolation is expected. ` +
+        `Unset VM_BUILD_QUEUE_URL to permit local builds, or implement the VM path for ${flavor}.`,
     );
   }
 }
