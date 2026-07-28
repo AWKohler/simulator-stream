@@ -392,10 +392,12 @@ function topUpPool(): void {
       },
       (e) => {
         liveVms--;
-        warn(`build VM warm-up failed: ${(e as Error).message}`);
-        // A build may be parked waiting for this VM; without a retry it would
-        // hang forever. Back off so a persistent failure doesn't spin.
-        if (vmWaiters.length > 0) setTimeout(() => topUpPool(), 5_000);
+        const msg = (e as Error).message;
+        warn(`build VM warm-up failed: ${msg}`);
+        // Always retry (backed off), not just when a build is waiting: losing the
+        // 2-guest race against a still-terminating VM is transient, and without a
+        // retry the pool would silently shrink and never recover.
+        setTimeout(() => topUpPool(), /exceeds the system limit/i.test(msg) ? 10_000 : 5_000);
       },
     );
   }
@@ -421,11 +423,25 @@ async function checkoutVm(onLog: (l: string, s: LogStream) => void): Promise<Poo
   return new Promise<PooledVm>((resolve) => vmWaiters.push(resolve));
 }
 
-/** Destroy a used VM (single-use isolation) and replenish the pool. */
+/**
+ * Destroy a used VM (single-use isolation), then replenish the pool.
+ *
+ * The teardown MUST complete before the slot is freed. Virtualization.framework
+ * counts a guest as live until it is fully gone, so decrementing early and
+ * booting a replacement immediately puts a 3rd guest in flight — Apple refuses
+ * it ("The number of VMs exceeds the system limit"), the replacement boot fails,
+ * and builds start erroring. This runs detached so the BUILD still returns
+ * immediately; only the pool top-up waits.
+ */
 function releaseVm(vm: PooledVm | null): void {
-  if (vm) void destroyVm(vm.name, vm.proc);
-  liveVms = Math.max(0, liveVms - 1);
-  topUpPool();
+  void (async () => {
+    try {
+      if (vm) await destroyVm(vm.name, vm.proc);
+    } finally {
+      liveVms = Math.max(0, liveVms - 1);
+      topUpPool();
+    }
+  })();
 }
 
 // ── tart helpers (host side) ────────────────────────────────────────────────
