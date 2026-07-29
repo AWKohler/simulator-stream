@@ -83,6 +83,24 @@ function assertGuestWritableBuildsRoot(): void {
 
 /** Guest build root. Equals BUILDS_ROOT so guest paths match host paths. */
 const GUEST_BUILD_ROOT = BUILDS_ROOT;
+/**
+ * RAM disk for build I/O — DEFAULT OFF.
+ *
+ * golden-build.md recommends an 8GB HFS+ RAM disk as "the dominant cost" fix,
+ * and it does help small builds. But it BREAKS large ones: with the RAM disk
+ * mounted at the build root, a real SpriteKit+Convex project failed with
+ * `xcodebuild encountered an error (74)` (EX_IOERR) after ~2min, while the SAME
+ * project on the guest's normal APFS disk built clean in 21s (608MB of
+ * DerivedData — nowhere near the 8GB volume, so it was never a space problem).
+ * The likely cause is Xcode's build system relying on APFS-only behaviour
+ * (clonefile/xattrs) that the HFS+ RAM disk can't provide.
+ *
+ * The warm pool's page-cache warm-up is the speed win that actually matters, and
+ * it works without this. Re-enable per-host with VM_BUILD_USE_RAMDISK=1 only if
+ * a future golden bakes an APFS RAM disk.
+ */
+const USE_RAMDISK = process.env.VM_BUILD_USE_RAMDISK === '1';
+
 /** RAM disk size for build I/O, in MiB. Backed by the GUEST's memory, so it must
  *  stay well under VM_MEMORY_MB — the runbook's 8GiB figure assumed a 32GB VM;
  *  at our 8GB default that would risk OOMing the guest. Pages are allocated
@@ -361,19 +379,19 @@ async function bootAndWarm(): Promise<PooledVm> {
     () => false,
   );
   const booted = Date.now();
-  await mountRamDisk(vm.ip);
+  if (USE_RAMDISK) await mountRamDisk(vm.ip);
   // Trust the filesystem, not the exit code: a silently-degraded mount is how
   // the first attempt shipped "warm" VMs that were neither ram-backed nor warm.
   const df = await execAsync(
     `${sshBase(vm.ip)} ${q(`df -k ${GUEST_BUILD_ROOT} | tail -1`)}`,
     { timeoutMs: 30_000 },
   );
-  const onRam = /\/dev\/disk/.test(df.stdout) && !/Volumes\/Data/.test(df.stdout);
+  const onRam = USE_RAMDISK && /\/dev\/disk/.test(df.stdout) && !/Volumes\/Data/.test(df.stdout);
   const mounted = Date.now();
   await warmPageCache(vm.ip);
   log(
     `build VM ${vm.name} ready: boot ${((booted - t0) / 1000).toFixed(1)}s, ` +
-      `ramdisk ${((mounted - booted) / 1000).toFixed(1)}s (${onRam ? 'ON RAM' : 'NOT ram-backed'}), ` +
+      `ramdisk ${((mounted - booted) / 1000).toFixed(1)}s (${USE_RAMDISK ? (onRam ? 'ON RAM' : 'NOT ram-backed') : 'disabled'}), ` +
       `warmup ${((Date.now() - mounted) / 1000).toFixed(1)}s`,
   );
   return { name: vm.name, ip: vm.ip, proc: vm.proc };
@@ -1082,7 +1100,10 @@ export function primeVmBuildPool(): void {
     return;
   }
   void reapOrphanedVms().then(() => {
-    log(`priming ${SLOTS} warm build VM(s) (ramdisk ${RAMDISK_MB}MB)…`);
+    log(
+      `priming ${SLOTS} warm build VM(s) ` +
+        `(ramdisk ${USE_RAMDISK ? `${RAMDISK_MB}MB` : 'disabled — see USE_RAMDISK'})…`,
+    );
     topUpPool();
   });
 }
