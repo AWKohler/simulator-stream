@@ -295,6 +295,53 @@ function poolStats(): string {
   return `live=${liveVms} warm=${warmQueue.length} waiters=${vmWaiters.length}`;
 }
 
+/** How long a build may sit parked before we assume the pool accounting is wrong. */
+const POOL_STALL_MS = 3 * 60_000;
+let poolWatchdog: NodeJS.Timeout | null = null;
+
+/**
+ * Resync `liveVms` with reality when builds are parked but nothing arrives.
+ *
+ * Observed in prod after a host reboot: every boot attempt failed (the guests
+ * could not DHCP), so `topUpPool` retried forever while `liveVms` stayed at
+ * SLOTS — the UI sat on "Waiting for a build slot (2 in use)" indefinitely with
+ * no path out. Counting the VMs that actually exist is the only trustworthy
+ * source of truth; the counter is a cache and caches go stale.
+ */
+function startPoolWatchdog(): void {
+  if (poolWatchdog) return;
+  poolWatchdog = setInterval(() => {
+    if (!vmWaiters.length) return;
+    if (Date.now() - (oldestWaiterAt ?? Date.now()) < POOL_STALL_MS) return;
+    void (async () => {
+      const listed = await tart(['list', '--format', 'json'], 30_000);
+      if (listed.code !== 0) return;
+      let running = 0;
+      try {
+        running = (JSON.parse(listed.out) as Array<{ Name?: string; State?: string }>).filter(
+          (r) => (r.Name ?? '').startsWith('bfbuild-') && r.State === 'running',
+        ).length;
+      } catch {
+        return;
+      }
+      const actual = running + warmQueue.length;
+      if (liveVms > actual) {
+        warn(
+          `pool stalled ${Math.round((Date.now() - (oldestWaiterAt ?? 0)) / 1000)}s with ` +
+            `${vmWaiters.length} waiting; liveVms=${liveVms} but only ${running} VM(s) exist — ` +
+            `resyncing and re-priming`,
+        );
+        liveVms = actual;
+        topUpPool();
+      }
+    })();
+  }, 60_000);
+  poolWatchdog.unref?.();
+}
+
+/** When the currently-oldest waiter started waiting (null when none). */
+let oldestWaiterAt: number | null = null;
+
 /**
  * Run a multi-line script in the guest by SHIPPING IT AS A FILE.
  *
@@ -423,6 +470,8 @@ function topUpPool(): void {
         const w = vmWaiters.shift();
         if (w) w.resolve(vm);
         else warmQueue.push(vm);
+        // Restart the stall clock for whoever is still queued behind this one.
+        oldestWaiterAt = vmWaiters.length ? Date.now() : null;
         log(`pool: VM ${vm.name} → ${w ? 'waiting build' : 'warm queue'} (${poolStats()})`);
       },
       (e) => {
@@ -461,6 +510,8 @@ async function checkoutVm(
   }
   onLog(`Waiting for a build slot (${SLOTS} in use)…`, 'stdout');
   log(`pool: checkout parked — no capacity (${poolStats()})`);
+  startPoolWatchdog();
+  if (oldestWaiterAt === null) oldestWaiterAt = Date.now();
   return new Promise<PooledVm>((resolve, reject) => {
     const waiter: VmWaiter = { resolve, reject };
     vmWaiters.push(waiter);
@@ -817,6 +868,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       if (idx >= 0) vmWaiters.splice(idx, 1);
       parkedWaiter.reject(new BuildAborted());
       parkedWaiter = null;
+      if (!vmWaiters.length) oldestWaiterAt = null;
     }
     try {
       if (sshProc && !sshProc.killed) sshProc.kill('SIGTERM');
