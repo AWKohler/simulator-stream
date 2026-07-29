@@ -278,7 +278,22 @@ const sessionGeneration = new Map<string, number>();
 /** warm + checked-out + currently booting. Must never exceed SLOTS. */
 let liveVms = 0;
 const warmQueue: PooledVm[] = [];
-const vmWaiters: Array<(vm: PooledVm) => void> = [];
+/**
+ * Builds parked waiting for a VM. Entries MUST be removable: a session that dies
+ * while parked would otherwise become a zombie — its resolver sits in the queue
+ * forever, and the next warm VM gets handed to a dead build that immediately
+ * destroys it. Under user retries that starves the pool indefinitely (every
+ * retry parks, dies, and eats the VM the previous retry was waiting for).
+ */
+interface VmWaiter {
+  resolve: (vm: PooledVm) => void;
+  reject: (e: Error) => void;
+}
+const vmWaiters: VmWaiter[] = [];
+
+function poolStats(): string {
+  return `live=${liveVms} warm=${warmQueue.length} waiters=${vmWaiters.length}`;
+}
 
 /**
  * Run a multi-line script in the guest by SHIPPING IT AS A FILE.
@@ -402,11 +417,13 @@ async function bootAndWarm(): Promise<PooledVm> {
 function topUpPool(): void {
   while (liveVms < SLOTS) {
     liveVms++;
+    log(`pool: booting a warm VM (${poolStats()})`);
     void bootAndWarm().then(
       (vm) => {
         const w = vmWaiters.shift();
-        if (w) w(vm);
+        if (w) w.resolve(vm);
         else warmQueue.push(vm);
+        log(`pool: VM ${vm.name} → ${w ? 'waiting build' : 'warm queue'} (${poolStats()})`);
       },
       (e) => {
         liveVms--;
@@ -422,14 +439,19 @@ function topUpPool(): void {
 }
 
 /** Take a ready VM, waiting if all slots are busy. */
-async function checkoutVm(onLog: (l: string, s: LogStream) => void): Promise<PooledVm> {
+async function checkoutVm(
+  onLog: (l: string, s: LogStream) => void,
+  onParked?: (waiter: VmWaiter) => void,
+): Promise<PooledVm> {
   const ready = warmQueue.shift();
   if (ready) {
+    log(`pool: checkout warm ${ready.name} (${poolStats()})`);
     topUpPool(); // replace it while this build runs
     return ready;
   }
   if (liveVms < SLOTS) {
     liveVms++;
+    log(`pool: checkout cold-booting (${poolStats()})`);
     try {
       return await bootAndWarm();
     } catch (e) {
@@ -438,7 +460,12 @@ async function checkoutVm(onLog: (l: string, s: LogStream) => void): Promise<Poo
     }
   }
   onLog(`Waiting for a build slot (${SLOTS} in use)…`, 'stdout');
-  return new Promise<PooledVm>((resolve) => vmWaiters.push(resolve));
+  log(`pool: checkout parked — no capacity (${poolStats()})`);
+  return new Promise<PooledVm>((resolve, reject) => {
+    const waiter: VmWaiter = { resolve, reject };
+    vmWaiters.push(waiter);
+    onParked?.(waiter);
+  });
 }
 
 /**
@@ -452,11 +479,17 @@ async function checkoutVm(onLog: (l: string, s: LogStream) => void): Promise<Poo
  * immediately; only the pool top-up waits.
  */
 function releaseVm(vm: PooledVm | null): void {
+  // A build that never owned a VM (checkout threw, or it was cancelled while
+  // parked) has no increment to give back. Decrementing here anyway skews
+  // liveVms low, so topUpPool over-boots into the 2-guest limit and the pool
+  // thrashes in boot-fail-retry loops.
+  if (!vm) return;
   void (async () => {
     try {
-      if (vm) await destroyVm(vm.name, vm.proc);
+      await destroyVm(vm.name, vm.proc);
     } finally {
       liveVms = Math.max(0, liveVms - 1);
+      log(`pool: released ${vm.name} (${poolStats()})`);
       topUpPool();
     }
   })();
@@ -772,9 +805,19 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
   let cancelled = false;
   let sshProc: ChildProcess | null = null;
   let vm: { name: string; proc: ChildProcess } | null = null;
+  let parkedWaiter: VmWaiter | null = null;
 
   const cancel = (): void => {
     cancelled = true;
+    // If this build is parked waiting for a VM, unhook it NOW. Leaving the
+    // waiter in the queue turns it into a zombie that consumes (and destroys)
+    // the next warm VM on behalf of a dead session.
+    if (parkedWaiter) {
+      const idx = vmWaiters.indexOf(parkedWaiter);
+      if (idx >= 0) vmWaiters.splice(idx, 1);
+      parkedWaiter.reject(new BuildAborted());
+      parkedWaiter = null;
+    }
     try {
       if (sshProc && !sshProc.killed) sshProc.kill('SIGTERM');
     } catch {
@@ -788,6 +831,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
   const done = (async (): Promise<VmCompileResult> => {
     const startedAt = Date.now();
     assertGuestWritableBuildsRoot();
+    log(`vm ${kind} build ${sessionId.slice(0, 8)}: start (${poolStats()})`);
     const myGen = (sessionGeneration.get(sessionId) ?? 0) + 1;
     sessionGeneration.set(sessionId, myGen);
     /** True once a newer build for this session has taken ownership. */
@@ -809,10 +853,19 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       mkdirSync(workdir, { recursive: true });
 
       const tCheckout = Date.now();
-      booted = await checkoutVm(onLog);
+      booted = await checkoutVm(onLog, (w) => (parkedWaiter = w));
+      parkedWaiter = null;
       const tGotVm = Date.now();
-      if (cancelled) throw new BuildAborted();
+      if (cancelled) {
+        // Cancel landed between hand-off and here: the VM is healthy and this
+        // build never touched it. Return it to the pool instead of burning it.
+        warmQueue.push(booted);
+        log(`pool: cancelled build returned ${booted.name} to pool (${poolStats()})`);
+        booted = null;
+        throw new BuildAborted();
+      }
       vm = { name: booted.name, proc: booted.proc };
+      log(`vm ${kind} build ${sessionId.slice(0, 8)}: got VM ${booted.name}`);
 
       // 1. Ship the project tarball in.
       const localTar = path.join(stage, 'job.tgz');
