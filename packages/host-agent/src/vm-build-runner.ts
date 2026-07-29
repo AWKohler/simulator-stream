@@ -331,7 +331,7 @@ function startPoolWatchdog(): void {
             `${vmWaiters.length} waiting; liveVms=${liveVms} but only ${running} VM(s) exist — ` +
             `resyncing and re-priming`,
         );
-        liveVms = actual;
+        setLiveVms(actual, 'watchdog resync');
         topUpPool();
       }
     })();
@@ -434,6 +434,37 @@ async function warmPageCache(ip: string): Promise<void> {
 }
 
 /** Boot a clone and make it build-ready: RAM disk mounted + page cache warm. */
+/**
+ * Guest egress dies whenever WARP (re)connects on a new utun: the PF vmnat
+ * anchor still routes into the OLD interface until the pf guard's next 300s
+ * tick regenerates it. A warm-up build in that window hangs on SPM network
+ * timeouts for up to WARMUP_TIMEOUT_MS per VM — after every reboot that
+ * serialized into ~6-7 min of "Waiting for a build slot" wedge. So: probe
+ * egress from inside the guest, and if it is dead, invoke the guard ON DEMAND
+ * (sudoers grants exactly this one script) instead of waiting for its timer.
+ */
+async function ensureGuestEgress(ip: string): Promise<boolean> {
+  const probe = async (): Promise<boolean> => {
+    const r = await execAsync(
+      `${sshBase(ip)} ${q('nc -z -G 5 github.com 443 >/dev/null 2>&1 && echo EGRESS_OK')}`,
+      { timeoutMs: 20_000 },
+    );
+    return r.stdout.includes('EGRESS_OK');
+  };
+  if (await probe()) return true;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    warn(`guest egress dead (attempt ${attempt}) — invoking pf guard to re-point the WARP anchor`);
+    await execAsync('sudo -n /usr/local/sbin/pf-egress-load.sh', { timeoutMs: 30_000 });
+    await new Promise((r) => setTimeout(r, 3000));
+    if (await probe()) {
+      log('guest egress restored by on-demand pf guard run');
+      return true;
+    }
+  }
+  warn('guest egress still dead after guard runs — builds needing new SPM deps will fail');
+  return false;
+}
+
 async function bootAndWarm(): Promise<PooledVm> {
   const t0 = Date.now();
   const vm = await bootBuildVm(
@@ -441,6 +472,9 @@ async function bootAndWarm(): Promise<PooledVm> {
     () => false,
   );
   const booted = Date.now();
+  // Fix egress BEFORE the warm-up build, or the warm-up itself hangs on SPM
+  // network timeouts and the "warm" pool takes minutes to produce its first VM.
+  await ensureGuestEgress(vm.ip);
   if (USE_RAMDISK) await mountRamDisk(vm.ip);
   // Trust the filesystem, not the exit code: a silently-degraded mount is how
   // the first attempt shipped "warm" VMs that were neither ram-backed nor warm.
@@ -461,9 +495,25 @@ async function bootAndWarm(): Promise<PooledVm> {
 
 /** Fire-and-forget top-up toward SLOTS. Hands a VM straight to a waiter if one
  *  is queued, else parks it warm. */
+/**
+ * The ONLY way liveVms may change. It is a count of real VMs, so it can never be
+ * negative and can never exceed SLOTS — Apple hard-caps concurrent guests at 2,
+ * and a counter below zero makes `while (liveVms < SLOTS)` spawn a boot storm
+ * (observed in prod at live=-10: a dozen concurrent boots, all failing the
+ * 2-guest limit, load average ~7, and no build ever getting a VM). Previously
+ * the decrements were scattered and unclamped, which is how it went negative.
+ */
+function setLiveVms(next: number, why: string): void {
+  const clamped = Math.min(SLOTS, Math.max(0, next));
+  if (clamped !== next) {
+    warn(`pool: liveVms ${next} out of range (${why}) — clamped to ${clamped}`);
+  }
+  liveVms = clamped;
+}
+
 function topUpPool(): void {
   while (liveVms < SLOTS) {
-    liveVms++;
+    setLiveVms(liveVms + 1, 'boot started');
     log(`pool: booting a warm VM (${poolStats()})`);
     void bootAndWarm().then(
       (vm) => {
@@ -475,7 +525,7 @@ function topUpPool(): void {
         log(`pool: VM ${vm.name} → ${w ? 'waiting build' : 'warm queue'} (${poolStats()})`);
       },
       (e) => {
-        liveVms--;
+        setLiveVms(liveVms - 1, 'boot failed');
         const msg = (e as Error).message;
         warn(`build VM warm-up failed: ${msg}`);
         // Always retry (backed off), not just when a build is waiting: losing the
@@ -499,12 +549,12 @@ async function checkoutVm(
     return ready;
   }
   if (liveVms < SLOTS) {
-    liveVms++;
+    setLiveVms(liveVms + 1, 'cold-boot checkout');
     log(`pool: checkout cold-booting (${poolStats()})`);
     try {
       return await bootAndWarm();
     } catch (e) {
-      liveVms--;
+      setLiveVms(liveVms - 1, 'cold-boot checkout failed');
       throw e;
     }
   }
@@ -539,7 +589,7 @@ function releaseVm(vm: PooledVm | null): void {
     try {
       await destroyVm(vm.name, vm.proc);
     } finally {
-      liveVms = Math.max(0, liveVms - 1);
+      setLiveVms(liveVms - 1, 'VM released');
       log(`pool: released ${vm.name} (${poolStats()})`);
       topUpPool();
     }
