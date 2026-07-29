@@ -43,11 +43,22 @@ if ! grep -q "$ANCHOR" "$CONF" 2>/dev/null; then
     "$ANCHOR" "$ANCHOR" "$ANCHOR" >> "$CONF"
   log "re-added simegress anchor refs to $CONF"
 fi
-if ! grep -q "$VMNAT" "$CONF" 2>/dev/null; then
+# The two vmnat refs must be checked INDEPENDENTLY. They live in different
+# sections and have been observed to drift apart: with only the nat-anchor
+# present, egress still worked (so it looked healthy) while every guest
+# ISOLATION rule sat in an anchor nothing ever evaluated. A single
+# `grep -q com.botflow.vmnat` would have called that state "fine".
+NEEDS_RELOAD=0
+if ! grep -q "^nat-anchor \"$VMNAT\"" "$CONF" 2>/dev/null; then
   # nat-anchor must live in the translation section, before any filter rules.
   /usr/bin/sed -i '' "s|nat-anchor \"com.apple/\*\"|nat-anchor \"com.apple/*\"\nnat-anchor \"$VMNAT\"|" "$CONF"
-  printf '\n# Botflow build-VM -> WARP forwarding (loaded anchor-scoped by pf-egress-load.sh)\nanchor "%s"\n' "$VMNAT" >> "$CONF"
-  log "re-added vmnat anchor refs to $CONF"
+  log "re-added vmnat NAT-anchor ref to $CONF"
+  NEEDS_RELOAD=1
+fi
+if ! grep -q "^anchor \"$VMNAT\"" "$CONF" 2>/dev/null; then
+  printf '\n# Botflow build-VM -> WARP forwarding (populated at runtime by pf-egress-load.sh)\nanchor "%s"\n' "$VMNAT" >> "$CONF"
+  log "re-added vmnat FILTER-anchor ref to $CONF (guest isolation was NOT being evaluated)"
+  NEEDS_RELOAD=1
 fi
 # NEVER let pf.conf load the vmnat anchor at BOOT. Its route-to rules name the
 # WARP utun, which does not exist until the WARP daemon connects — pfctl then
@@ -103,6 +114,17 @@ VMNATDOWN
     pfctl -a "$VMNAT" -f "$VMNAT_FILE" >/dev/null 2>&1
     log "vmnat: no WARP interface — installed fail-closed ruleset (guests: DHCP/DNS only)"
   fi
+fi
+
+# A newly-added anchor REF only takes effect on a main-ruleset reload, which
+# would flush vmnet's NAT and WARP's own anchor — unacceptable to do from an
+# unattended 300s timer (that is the bug this whole file exists to avoid). The
+# ref is now persisted in pf.conf, so the next boot picks it up naturally; until
+# then, say so loudly rather than pretending the rules are live.
+if [ "$NEEDS_RELOAD" = "1" ]; then
+  log "WARNING: pf.conf refs were repaired but are NOT live until a main reload." \
+      "Run 'pfctl -f /etc/pf.conf' then restart host-agent (recreates vmnet NAT)" \
+      "and confirm WARP re-asserts its anchor — or simply reboot."
 fi
 
 # PF itself must be enabled (idempotent).
