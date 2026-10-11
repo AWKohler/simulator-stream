@@ -28,6 +28,31 @@ longer an exit node for any user-controlled traffic.
 - Cold-reboot recovery: WARP watchdog reconnects, guard reloads anchors
   (see `postboot-verify` results in the session logs).
 
+## Tailscale under WARP (16GB Air rebuild, 2026-10-11)
+
+On the rebuilt host (`botflows-macbook-air`, Tailscale 1.104 standalone),
+connecting WARP took the box OFF the tailnet — the only management path —
+twice. Two separate causes:
+
+1. **accept-routes was on**, pulling in the Pi's `192.168.0.0/24` subnet route,
+   which is also the host's own LAN. WARP pins `192.168.0.0/16` to the physical
+   interface; Tailscale kept re-claiming it. Fix: `tailscale set
+   --accept-routes=false` (a sim host must not reach the home LAN anyway).
+2. **Tailscale binds its sockets to the physical interface**, and WARP's PF
+   firewall drops every non-tunnel flow there unless the destination is in the
+   split-tunnel EXCLUDE list. Proof: with WARP up, `curl` to derp1 and
+   controlplane worked (through the tunnel) while `tailscale status` said
+   offline, and WARP logged ~1000 route lookups/30s (Tailscale's netcheck storm
+   over its DERP list). Fix: `warp-tailscale-excludes.sh` excludes exactly the
+   DERP nodes from Tailscale's published DERP map plus the control/log
+   endpoints; the watchdog runs it before every connect and a LaunchDaemon
+   refreshes it hourly. Only Tailscale infrastructure leaves via the home IP.
+
+**Test WARP changes with an auto-revert**, never a bare `connect`: e.g.
+`rm -f /tmp/warp-ok; nohup bash -c 'warp-cli --accept-tos connect; sleep 150;
+[ -f /tmp/warp-ok ] || warp-cli --accept-tos disconnect' &` and `touch
+/tmp/warp-ok` over SSH once you are back in.
+
 ## Operational notes
 
 - **Tailscale management path now relays via DERP** (direct UDP path doesn't

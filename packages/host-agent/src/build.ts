@@ -883,6 +883,12 @@ export interface LaunchCameraInjection {
   cameraUrl: string;
 }
 
+// The first launch after a boot waits for SpringBoard to settle. On a small
+// host (16GB Air: two sims booting beside two compiling build VMs) that took
+// longer than the original 15s, so both concurrent sessions died with an empty
+// "simctl launch failed". Overridable for slower/faster hosts.
+const LAUNCH_TIMEOUT_MS = parseInt(process.env.SIM_LAUNCH_TIMEOUT_MS ?? '60000', 10) || 60_000;
+
 export async function installAndLaunch(
   udid: string,
   appBundlePath: string,
@@ -923,15 +929,19 @@ export async function installAndLaunch(
       .map(([k, v]) => `${k}='${v}'`)
       .join(' ');
     launch = await execAsSimUser(envPrefix ? `env ${envPrefix} ${launchCore}` : launchCore, {
-      timeoutMs: 15_000,
+      timeoutMs: LAUNCH_TIMEOUT_MS,
     });
   } else {
     launch = await execAsync(launchCore, {
-      timeoutMs: 15_000,
+      timeoutMs: LAUNCH_TIMEOUT_MS,
       env: Object.keys(childEnv).length ? childEnv : undefined,
     });
   }
   if (launch.code !== 0) {
-    throw new Error(`simctl launch failed: ${launch.stderr || launch.stdout}`);
+    // A killed-on-timeout exec reports a null code and no output; say so rather
+    // than surfacing an empty "simctl launch failed: ".
+    const detail =
+      launch.stderr || launch.stdout || `no output (timed out after ${LAUNCH_TIMEOUT_MS / 1000}s?)`;
+    throw new Error(`simctl launch failed: ${detail}`);
   }
 }

@@ -16,10 +16,14 @@
 //     networking to the CIDRs a build legitimately needs.
 //   • Only bytes cross back: a tar of the .app and the .xcresult.
 //
-// Capacity: Virtualization.framework hard-caps concurrent macOS guests at 2 per
-// host (empirically confirmed — a 3rd `tart run` fails with "The number of VMs
-// exceeds the system limit"). ALL build flavors share those 2 slots; overflow
-// waits in a FIFO queue.
+// Capacity: Virtualization.framework caps concurrent macOS guests at 2 per host
+// by default (empirically confirmed — a 3rd `tart run` fails with "The number of
+// VMs exceeds the system limit"). ALL build flavors share the slots; overflow
+// waits in a FIFO queue. The cap is the kernel's hv_apple_isa_vm_quota, which a
+// host booted on a development kernel collection with
+// `hypervisor=0x1 hv_apple_isa_vm_quota=N` raises — only then set
+// VM_BUILD_SLOTS above 2 (the 16GB Air sim host runs that way; see
+// infra/vm-quota.md). On a stock host a 3rd slot just fails its boots.
 //
 // Performance: a naive boot-per-build measured ~45s vs ~11s bare metal. The cost
 // was NOT teardown (1s) but a cold guest — the golden's RAM-disk daemon hangs at
@@ -34,7 +38,7 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import type { LogStream } from '@sim/shared';
-import { execAsync } from './util.js';
+import { execAsync, simUserEnabled, spawnAsSimUser, wrapAsSimUser } from './util.js';
 import { parseProjectYml } from './project-yml.js';
 import { log, warn } from './log.js';
 import { extractDiagnostics, sanitize, sanitizeLine } from './build-diagnostics.js';
@@ -59,11 +63,30 @@ import { normalizeP8, uploadIpaToAppStoreConnect } from './asc-upload.js';
 import { placeholderIcon1024 } from './default-icon.js';
 
 const TART = process.env.TART_BIN ?? '/opt/homebrew/bin/tart';
+/**
+ * Run tart (and so the VMs) as the sim user instead of the orchestrator.
+ *
+ * Virtualization.framework creates a per-host identity key in the Secure
+ * Enclave for the user that runs a macOS guest, and the SEP refuses
+ * (errKCInteractionNotAllowed -> VZErrorDomain -9 "Failed to create new
+ * HostKey") unless that user's keybag is unlocked by a real login session. On
+ * the sim host the ONLY login session is the sim user's (it holds the console
+ * for the simulators), so tart run as the orchestrator — or as root — cannot
+ * boot a guest after a reboot. As the sim user it can.
+ *
+ * Only tart moves: the orchestrator still drives the guests over SSH/SCP. A
+ * guest escape lands in the least-privileged, PF-contained sim user rather
+ * than the admin orchestrator. Requires TART_BIN and the golden image to be
+ * reachable by the sim user (its own ~/.tart, since sudo -H sets HOME).
+ */
+const TART_AS_SIM_USER =
+  simUserEnabled() && (process.env.VM_BUILD_TART_AS_SIM_USER ?? '0') === '1';
 const GOLDEN = process.env.VM_BUILD_GOLDEN ?? 'golden-v3';
 const GUEST_USER = process.env.VM_BUILD_GUEST_USER ?? 'admin';
 const GUEST_PASS = process.env.VM_BUILD_GUEST_PASS ?? 'admin';
-/** Concurrent build VMs. Virtualization.framework refuses a 3rd macOS guest. */
-const SLOTS = Math.max(1, Math.min(2, parseInt(process.env.VM_BUILD_SLOTS ?? '2', 10) || 2));
+/** Concurrent build VMs. Default 2 (the stock Virtualization.framework cap);
+ * higher only on a host whose VM quota was raised (see Capacity above). */
+const SLOTS = Math.max(1, Math.min(16, parseInt(process.env.VM_BUILD_SLOTS ?? '2', 10) || 2));
 const VM_MEMORY_MB = parseInt(process.env.VM_BUILD_MEMORY_MB ?? '8192', 10) || 8192;
 const VM_CPU = parseInt(process.env.VM_BUILD_CPU ?? '6', 10) || 6;
 /** Comma-separated CIDRs the guest may reach (tart Softnet). Unset = unrestricted. */
@@ -599,7 +622,8 @@ function releaseVm(vm: PooledVm | null): void {
 // ── tart helpers (host side) ────────────────────────────────────────────────
 
 async function tart(args: string[], timeoutMs = 60_000): Promise<{ code: number; out: string }> {
-  const res = await execAsync(`${q(TART)} ${args.map(q).join(' ')}`, { timeoutMs });
+  const cmd = `${q(TART)} ${args.map(q).join(' ')}`;
+  const res = await execAsync(TART_AS_SIM_USER ? wrapAsSimUser(cmd) : cmd, { timeoutMs });
   // execAsync reports a null code when the process was signalled; treat that as
   // failure rather than coercing it to 0.
   return { code: res.code ?? -1, out: `${res.stdout}${res.stderr}` };
@@ -644,7 +668,10 @@ async function bootBuildVm(
     // even with full control of the guest.
     runArgs.push('--net-softnet', `--net-softnet-allow=${NET_ALLOW}`);
   }
-  const proc = spawn(TART, runArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  // As the sim user, `proc` is the sudo/launchctl wrapper; killing it may not
+  // reach tart, but destroyVm always follows with `tart stop`, which does.
+  const launch = TART_AS_SIM_USER ? spawnAsSimUser(TART, runArgs) : { cmd: TART, args: runArgs };
+  const proc = spawn(launch.cmd, launch.args, { stdio: ['ignore', 'ignore', 'pipe'] });
   proc.stderr?.on('data', (d: Buffer) => {
     const m = d.toString().trim();
     if (m) warn(`vm ${name}: ${m.split('\n')[0]}`);

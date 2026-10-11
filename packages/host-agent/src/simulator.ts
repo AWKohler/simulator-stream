@@ -4,6 +4,7 @@ import type { DeviceModel, Orientation } from '@sim/shared';
 import { execAsync, execAsSimUser, wrapAsSimUser, simUserEnabled, sleep } from './util.js';
 import { postOrientation } from './notifypost.js';
 import { log, warn } from './log.js';
+import { applyLean } from './lean.js';
 
 // All CoreSimulator commands target the SIM USER's device set (see util.ts).
 // In dev/VM (SIM_RUN_USER unset) wrapAsSimUser is a no-op, so these are plain.
@@ -197,6 +198,10 @@ export async function ensurePool(slots: number): Promise<string[]> {
 export async function bootSimulator(udid: string, timeoutMs = 90_000): Promise<boolean> {
   const current = getSimulatorState(udid);
   if (current === 'Booted') return true;
+
+  // Only a shut-down device's overrides are safe to rewrite (launchd_sim reads
+  // them at start).
+  if (current === 'Shutdown') await applyLean(udid);
 
   log(`Booting ${udid}...`);
   // Don't await — `simctl boot` blocks until boot completes which can be slow;
