@@ -3,6 +3,15 @@ import { existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { execAsSimUser, spawnAsSimUser, simUserEnabled } from './util.js';
 import { log, warn } from './log.js';
+import {
+  closeHidClient,
+  keyEvents,
+  sendHidEvents,
+  swipeEvents,
+  tapEvents,
+  textEvents,
+  type HidEvent,
+} from './idb-hid.js';
 
 // pip3/conda can install idb into various prefixes depending on the environment.
 const IDB_CANDIDATES = [
@@ -94,6 +103,43 @@ export function detect(): { hasIDB: boolean; idbBin: string | null; companionBin
 const companions = new Map<string, ChildProcess>();
 const IDB_SOCK_DIR = '/tmp/idb';
 
+// Resolves once the companion for a UDID is serving gRPC on its socket and the
+// orchestrator can connect to it (see markSocketReady). Inputs wait on this so
+// the first tap after boot doesn't race the companion's startup.
+const socketReady = new Map<string, { promise: Promise<boolean>; resolve: (ok: boolean) => void }>();
+
+function readinessFor(udid: string) {
+  let entry = socketReady.get(udid);
+  if (!entry) {
+    let resolve!: (ok: boolean) => void;
+    const promise = new Promise<boolean>((r) => {
+      resolve = r;
+    });
+    entry = { promise, resolve };
+    socketReady.set(udid, entry);
+  }
+  return entry;
+}
+
+/**
+ * The companion runs as the sim user and binds its socket with that user's
+ * umask (0755) — but connecting to a Unix socket needs write permission, so the
+ * orchestrator (a different user) couldn't reach it. Open it up as the sim user
+ * once the companion has (re)created it.
+ */
+async function markSocketReady(udid: string): Promise<void> {
+  const sock = companionSocketPath(udid);
+  let ok = true;
+  if (simUserEnabled()) {
+    const res = await execAsSimUser(`/bin/chmod 666 '${sock}'`, { timeoutMs: 5_000 });
+    if (res.code !== 0) {
+      warn(`companion socket chmod failed for ${udid.slice(0, 6)}: ${(res.stderr || res.stdout).trim()}`);
+      ok = false;
+    }
+  }
+  readinessFor(udid).resolve(ok);
+}
+
 /** The Unix domain socket path the companion for `udid` binds to. */
 export function companionSocketPath(udid: string): string {
   return `${IDB_SOCK_DIR}/${udid}_companion.sock`;
@@ -117,13 +163,18 @@ export function startCompanion(udid: string): void {
   const proc = spawn(spawned.cmd, spawned.args, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  readinessFor(udid);
   proc.stderr?.on('data', (d: Buffer) => {
     const msg = d.toString().trim();
     if (msg) log(`companion[${udid.slice(0, 6)}]: ${msg.split('\n')[0]}`);
+    if (msg.includes('Swift server started')) void markSocketReady(udid);
   });
   proc.on('exit', (code) => {
     log(`idb_companion ${udid.slice(0, 6)} exited: ${code}`);
-    companions.delete(udid);
+    if (companions.get(udid) === proc) {
+      companions.delete(udid);
+      forgetSocket(udid);
+    }
   });
   companions.set(udid, proc);
 }
@@ -133,18 +184,27 @@ export function hasCompanion(udid: string): boolean {
   return companions.has(udid);
 }
 
+function forgetSocket(udid: string): void {
+  socketReady.get(udid)?.resolve(false);
+  socketReady.delete(udid);
+  hidFastPathLogged.delete(udid);
+  closeHidClient(companionSocketPath(udid));
+}
+
 export function stopCompanion(udid: string): void {
   const proc = companions.get(udid);
   if (proc) {
     proc.kill();
     companions.delete(udid);
   }
+  forgetSocket(udid);
 }
 
 export function stopAllCompanions(): void {
   for (const [udid, proc] of companions) {
     proc.kill();
     companions.delete(udid);
+    forgetSocket(udid);
   }
 }
 
@@ -162,7 +222,45 @@ async function idbCmd(udid: string, args: string, label: string): Promise<void> 
   }
 }
 
+// How long an input waits for a just-started companion before giving up on the
+// fast path. Boot → companion ready is normally well under this.
+const COMPANION_READY_WAIT_MS = 10_000;
+const hidFallbackWarned = new Set<string>();
+const hidFastPathLogged = new Set<string>();
+
+/**
+ * Send events straight to the device's companion over gRPC. Returns false (and
+ * the caller uses the idb CLI instead) when there's no companion yet or the
+ * call fails, so input keeps working — just slowly — if the fast path breaks.
+ */
+async function sendViaCompanion(udid: string, events: HidEvent[], label: string): Promise<boolean> {
+  const entry = socketReady.get(udid);
+  if (!entry || !companions.has(udid)) return false;
+  const ready = await Promise.race([
+    entry.promise,
+    new Promise<boolean>((r) => setTimeout(() => r(false), COMPANION_READY_WAIT_MS).unref()),
+  ]);
+  if (!ready) return false;
+  try {
+    const started = Date.now();
+    await sendHidEvents(companionSocketPath(udid), events);
+    if (!hidFastPathLogged.has(udid)) {
+      hidFastPathLogged.add(udid);
+      log(`idb ${label} via companion gRPC ok (${Date.now() - started}ms) for ${udid.slice(0, 6)}`);
+    }
+    return true;
+  } catch (e) {
+    const key = `${udid}:${label}`;
+    if (!hidFallbackWarned.has(key)) {
+      hidFallbackWarned.add(key);
+      warn(`idb ${label} via companion failed (${(e as Error).message}); falling back to idb CLI`);
+    }
+    return false;
+  }
+}
+
 export async function tap(udid: string, x: number, y: number): Promise<void> {
+  if (await sendViaCompanion(udid, tapEvents(x, y), 'tap')) return;
   await idbCmd(udid, `ui tap ${x} ${y}`, 'tap');
 }
 
@@ -173,6 +271,7 @@ export async function swipe(
   endX: number,
   endY: number,
 ): Promise<void> {
+  if (await sendViaCompanion(udid, swipeEvents(startX, startY, endX, endY), 'swipe')) return;
   await idbCmd(udid, `ui swipe ${startX} ${startY} ${endX} ${endY}`, 'swipe');
 }
 
@@ -209,7 +308,10 @@ export function hidCodeForKey(key: string): number | null {
  * go through a shell string.
  */
 export async function sendText(udid: string, text: string): Promise<void> {
-  if (!idbBin || text.length === 0) return;
+  if (text.length === 0) return;
+  const events = textEvents(text);
+  if (events && (await sendViaCompanion(udid, events, 'text'))) return;
+  if (!idbBin) return;
   await new Promise<void>((resolve) => {
     // text is untrusted — keep it a discrete argv element (no shell string).
     const spawned = spawnAsSimUser(idbBin!, ['ui', 'text', text, '--udid', udid]);
@@ -235,5 +337,6 @@ export async function sendText(udid: string, text: string): Promise<void> {
 export async function sendKey(udid: string, key: string): Promise<void> {
   const code = hidCodeForKey(key);
   if (code === null) return;
+  if (await sendViaCompanion(udid, keyEvents(code), 'key')) return;
   await idbCmd(udid, `ui key ${code}`, 'key');
 }
