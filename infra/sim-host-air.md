@@ -33,6 +33,15 @@ and Cloudflare tunnel, so the Botflow web app needed no change.
 `com.botflow.xcode-select-guard`, `com.botflow.pmset-guard`.
 Logs: `~botflow/Library/Logs/simstream/`, `/var/log/*.log`.
 
+`com.simstream.host-agent` **must** carry `<key>ProcessType</key><string>Interactive</string>`.
+Without it launchd applies its default "light resource limits" to the job and
+everything it spawns, coalescing timers: the framebuffer capturer (60 Hz
+dispatch timer) delivered ~13 fps to browsers while an identical capturer
+started from a shell did 60. Verify with
+`sudo launchctl print system/com.simstream.host-agent | grep "spawn type"` →
+`interactive (4)`. Changing the plist needs `bootout` + `bootstrap`
+(`kickstart -k` does not re-read it).
+
 ## Host-agent settings that differ from the old box
 
 | Env | Value | Why |
