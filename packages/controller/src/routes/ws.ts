@@ -295,7 +295,7 @@ function handleSessionEvent(
       const wi = msg.payload?.windowInfo;
       const sr = msg.payload?.screenRect;
       const dl = msg.payload?.deviceLogical;
-      if (wi && sr && dl) proxy.updateCalibration(msg.sessionId, wi, sr, dl);
+      if (wi && sr && dl) proxy.updateCalibration(msg.sessionId, wi, sr, dl, msg.payload?.features);
       orch.markStreaming(msg.sessionId);
       proxy.updateState(msg.sessionId, 'streaming');
       break;

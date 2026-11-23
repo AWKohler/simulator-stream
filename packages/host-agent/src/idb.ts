@@ -153,27 +153,46 @@ export function stopAllCompanions(): void {
 // (a missed tap shouldn't kill a session).
 // ──────────────────────────────────────────────────────────────────────────────
 
-async function idbCmd(udid: string, args: string, label: string): Promise<void> {
+async function idbCmd(udid: string, args: string, label: string, gestureMs = 0): Promise<void> {
   if (!idbBin) return;
   const cmd = `"${idbBin}" ${args} --udid ${udid}`;
-  const res = await execAsSimUser(cmd, { timeoutMs: 5_000 });
+  // A gesture with a duration runs for that long before idb returns.
+  const res = await execAsSimUser(cmd, { timeoutMs: 5_000 + gestureMs });
   if (res.code !== 0) {
     warn(`idb ${label} failed: ${(res.stderr || res.stdout).split('\n')[0]}`);
   }
 }
 
-export async function tap(udid: string, x: number, y: number): Promise<void> {
-  await idbCmd(udid, `ui tap ${x} ${y}`, 'tap');
+/** idb takes durations in seconds; anything under a frame is left to its default. */
+function durationFlag(durationMs: number | undefined): string {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 16) return '';
+  return ` --duration ${(Math.min(durationMs, 3000) / 1000).toFixed(3)}`;
 }
 
+/** A tap, or with `durationMs` a press held that long (context menus, drag handles). */
+export async function tap(udid: string, x: number, y: number, durationMs?: number): Promise<void> {
+  await idbCmd(udid, `ui tap ${x} ${y}${durationFlag(durationMs)}`, 'tap', durationMs ?? 0);
+}
+
+/**
+ * A swipe from start to end. With `durationMs` it takes that long, so the
+ * touch lets go at the speed the person's finger was moving: a slow drag
+ * stops near where it ended instead of flinging on.
+ */
 export async function swipe(
   udid: string,
   startX: number,
   startY: number,
   endX: number,
   endY: number,
+  durationMs?: number,
 ): Promise<void> {
-  await idbCmd(udid, `ui swipe ${startX} ${startY} ${endX} ${endY}`, 'swipe');
+  await idbCmd(
+    udid,
+    `ui swipe ${startX} ${startY} ${endX} ${endY}${durationFlag(durationMs)}`,
+    'swipe',
+    durationMs ?? 0,
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
