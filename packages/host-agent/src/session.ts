@@ -31,6 +31,8 @@ import {
   stopCompanion,
   swipe,
   tap,
+  liveTouch,
+  pressButton,
   sendText,
   sendKey,
   hasIDB,
@@ -785,6 +787,18 @@ export class Session extends EventEmitter {
         await swipe(this.udid, start.x, start.y, end.x, end.y, input.durationMs, input.endHoldMs);
         break;
       }
+      case 'touch': {
+        // Nothing is awaited here: touch events must stay in order.
+        const pt = windowNormToDeviceLogical(input.normX, input.normY, wi, sr, dl) ?? {
+          x: clampPt(input.normX * dl.w, 0, dl.w),
+          y: clampPt(input.normY * dl.h, 0, dl.h),
+        };
+        liveTouch(this.udid, input.phase, pt.x, pt.y);
+        break;
+      }
+      case 'button':
+        await pressButton(this.udid, input.button);
+        break;
       case 'scroll':
         this.injectScroll(input.normX, input.normY, input.deltaX, input.deltaY);
         break;

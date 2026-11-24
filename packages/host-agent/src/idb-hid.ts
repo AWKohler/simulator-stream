@@ -28,7 +28,10 @@ interface GrpcPoint {
   y: number;
 }
 
-type HidPressAction = { touch: { point: GrpcPoint } } | { key: { keycode: number } };
+type HidPressAction =
+  | { touch: { point: GrpcPoint } }
+  | { key: { keycode: number } }
+  | { button: { button: 'HOME' | 'LOCK' } };
 
 export type HidEvent =
   | { press: { action: HidPressAction; direction: 'DOWN' | 'UP' } }
@@ -102,6 +105,57 @@ export function sendHidEvents(socketPath: string, events: HidEvent[], timeoutMs 
     for (const event of events) call.write(event);
     call.end();
   });
+}
+
+// ── Live touch ──────────────────────────────────────────────────────────────
+
+/**
+ * One finger, forwarded as it moves. Each touch is its own `hid` call, kept
+ * open from finger-down to finger-up, so the companion acts on every event as
+ * it arrives and the simulator sees a real, continuous touch.
+ */
+export interface LiveTouch {
+  move(x: number, y: number): void;
+  /** Lift the finger and close the call. Safe to call more than once. */
+  up(x?: number, y?: number): void;
+}
+
+/** A touch may stay down this long at most (a stuck finger must not outlive its session). */
+const LIVE_TOUCH_MAX_MS = 30_000;
+
+export function beginLiveTouch(socketPath: string, x: number, y: number, onClosed?: () => void): LiveTouch {
+  const client = clientFor(socketPath);
+  let last = { x, y };
+  let open = true;
+  const call = client.hid({ deadline: Date.now() + LIVE_TOUCH_MAX_MS + 2_000 }, (error) => {
+    open = false;
+    if (error && error.code === grpc.status.UNAVAILABLE) closeHidClient(socketPath);
+    onClosed?.();
+  });
+  call.write({ press: { action: { touch: { point: last } }, direction: 'DOWN' } });
+  const limit = setTimeout(() => touch.up(), LIVE_TOUCH_MAX_MS);
+  limit.unref();
+  const touch: LiveTouch = {
+    move(nx, ny) {
+      if (!open) return;
+      last = { x: nx, y: ny };
+      // A touch-down at a new point while the finger is down is a move.
+      call.write({ press: { action: { touch: { point: last } }, direction: 'DOWN' } });
+    },
+    up(nx, ny) {
+      if (!open) return;
+      open = false;
+      clearTimeout(limit);
+      if (nx !== undefined && ny !== undefined) last = { x: nx, y: ny };
+      call.write({ press: { action: { touch: { point: last } }, direction: 'UP' } });
+      call.end();
+    },
+  };
+  return touch;
+}
+
+export function buttonEvents(button: 'HOME' | 'LOCK'): HidEvent[] {
+  return press({ button: { button } });
 }
 
 // ── Event builders ──────────────────────────────────────────────────────────

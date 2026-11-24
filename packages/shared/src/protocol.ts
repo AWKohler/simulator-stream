@@ -138,7 +138,11 @@ export type ResourceReport = z.infer<typeof ResourceReport>;
 //                      the finger was really moving).
 //   swipe-end-hold   — `endHoldMs` on swipe: the finger rests at the end before
 //                      lifting, so a scroll stops where it is.
-export const INPUT_FEATURES = ['gesture-duration', 'swipe-end-hold'] as const;
+//   touch-stream     — `touch` inputs: the finger itself, as it goes down, moves
+//                      and lifts, so content follows it and taps, holds, drags
+//                      and flicks need no interpreting by the client.
+//   hardware-buttons — `button` inputs (Home, Lock).
+export const INPUT_FEATURES = ['gesture-duration', 'swipe-end-hold', 'touch-stream', 'hardware-buttons'] as const;
 export type InputFeature = (typeof INPUT_FEATURES)[number];
 
 /** The longest a single replayed gesture may last. */
@@ -162,6 +166,19 @@ export const SwipeInput = z.object({
   // How long the finger rests at the end before lifting. Omitted: it lifts at once.
   endHoldMs: z.number().min(0).max(1000).optional(),
 });
+// One finger, live. `down` starts a touch, `move` moves it, `up` lifts it.
+// A touch left down (client gone) is lifted by the host after a few seconds.
+export const TouchInput = z.object({
+  kind: z.literal('touch'),
+  phase: z.enum(['down', 'move', 'up']),
+  normX: z.number(),
+  normY: z.number(),
+});
+// A hardware button press.
+export const ButtonInput = z.object({
+  kind: z.literal('button'),
+  button: z.enum(['home', 'lock']),
+});
 export const ScrollInput = z.object({
   kind: z.literal('scroll'),
   normX: z.number(),
@@ -184,6 +201,8 @@ export const KeyInput = z.object({
 export const Input = z.discriminatedUnion('kind', [
   TapInput,
   SwipeInput,
+  TouchInput,
+  ButtonInput,
   ScrollInput,
   TextInput,
   KeyInput,

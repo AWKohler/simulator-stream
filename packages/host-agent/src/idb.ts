@@ -4,6 +4,9 @@ import { homedir } from 'node:os';
 import { execAsSimUser, spawnAsSimUser, simUserEnabled } from './util.js';
 import { log, warn } from './log.js';
 import {
+  beginLiveTouch,
+  buttonEvents,
+  type LiveTouch,
   pacedSwipeEvents,
   holdEvents,
   closeHidClient,
@@ -191,6 +194,7 @@ function forgetSocket(udid: string): void {
   socketReady.get(udid)?.resolve(false);
   socketReady.delete(udid);
   hidFastPathLogged.delete(udid);
+  cancelLiveTouch(udid);
   closeHidClient(companionSocketPath(udid));
 }
 
@@ -309,6 +313,65 @@ export async function swipe(
     'swipe',
     gestureMs(durationMs),
   );
+}
+
+// One live touch per device at a time (a single finger).
+const liveTouches = new Map<string, { touch: LiveTouch; idle: NodeJS.Timeout }>();
+
+/** A finger left down with nothing arriving is lifted after this long. */
+const LIVE_TOUCH_IDLE_MS = 8_000;
+
+function endLiveTouch(udid: string, x?: number, y?: number): void {
+  const entry = liveTouches.get(udid);
+  if (!entry) return;
+  clearTimeout(entry.idle);
+  liveTouches.delete(udid);
+  entry.touch.up(x, y);
+}
+
+/**
+ * The finger itself, forwarded as it moves. Synchronous on purpose: events
+ * must reach the companion in the order they arrived, with nothing awaited in
+ * between. Returns false when there is no companion to send to (the client
+ * falls back to whole gestures).
+ */
+export function liveTouch(udid: string, phase: 'down' | 'move' | 'up', x: number, y: number): boolean {
+  if (!companions.has(udid)) return false;
+  const existing = liveTouches.get(udid);
+  if (phase === 'down') {
+    if (existing) endLiveTouch(udid);
+    const touch = beginLiveTouch(companionSocketPath(udid), x, y, () => {
+      const current = liveTouches.get(udid);
+      if (current?.touch === touch) {
+        clearTimeout(current.idle);
+        liveTouches.delete(udid);
+      }
+    });
+    const idle = setTimeout(() => endLiveTouch(udid), LIVE_TOUCH_IDLE_MS);
+    idle.unref();
+    liveTouches.set(udid, { touch, idle });
+    return true;
+  }
+  if (!existing) return false;
+  if (phase === 'move') {
+    existing.idle.refresh();
+    existing.touch.move(x, y);
+  } else {
+    endLiveTouch(udid, x, y);
+  }
+  return true;
+}
+
+/** Lift any finger still down on a device (its session is ending). */
+export function cancelLiveTouch(udid: string): void {
+  endLiveTouch(udid);
+}
+
+/** A hardware button: Home or Lock. */
+export async function pressButton(udid: string, button: 'home' | 'lock'): Promise<void> {
+  const events = buttonEvents(button === 'home' ? 'HOME' : 'LOCK');
+  if (await sendViaCompanion(udid, events, `button ${button}`)) return;
+  await idbCmd(udid, `ui button ${button.toUpperCase()}`, 'button');
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
