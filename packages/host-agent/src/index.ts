@@ -12,6 +12,7 @@ import {
   deviceTypeMatchesModel,
 } from './simulator.js';
 import type { DeviceModel, Orientation } from '@sim/shared';
+import { INPUT_FEATURES } from '@sim/shared';
 import { detect, hasIDB, stopAllCompanions } from './idb.js';
 import { ensureCompiled } from './capturer.js';
 import { ensureFramebufferCapturer } from './framebuffer-capturer.js';
@@ -444,6 +445,8 @@ async function main(): Promise<void> {
             windowInfo: payload.windowInfo,
             screenRect: payload.screenRect,
             deviceLogical: payload.deviceLogical,
+            // Tell clients which optional input fields this host honours.
+            features: [...INPUT_FEATURES],
           },
         });
       } else if (phase === 'error') {

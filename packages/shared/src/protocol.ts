@@ -128,10 +128,26 @@ export type ResourceReport = z.infer<typeof ResourceReport>;
 // Input events (browser → controller → host)
 // ──────────────────────────────────────────────────────────────────────────────
 
+// What a host can do with an input beyond the basics. A host lists these in
+// its `ready` event and the controller passes them on in `calibration`, so a
+// client knows whether the optional fields below will be honoured. Older
+// hosts list nothing and ignore the fields.
+//
+//   gesture-duration — `durationMs` on tap (press and hold) and on swipe
+//                      (replayed over that long, so it lets go at the speed
+//                      the finger was really moving).
+export const INPUT_FEATURES = ['gesture-duration'] as const;
+export type InputFeature = (typeof INPUT_FEATURES)[number];
+
+/** The longest a single replayed gesture may last. */
+export const MAX_GESTURE_MS = 3000;
+
 export const TapInput = z.object({
   kind: z.literal('tap'),
   normX: z.number(),
   normY: z.number(),
+  // How long the finger stays down. Omitted: a plain tap.
+  durationMs: z.number().min(0).max(MAX_GESTURE_MS).optional(),
 });
 export const SwipeInput = z.object({
   kind: z.literal('swipe'),
@@ -139,6 +155,8 @@ export const SwipeInput = z.object({
   startY: z.number(),
   endX: z.number(),
   endY: z.number(),
+  // How long the swipe takes from start to end. Omitted: idb's default speed.
+  durationMs: z.number().min(0).max(MAX_GESTURE_MS).optional(),
 });
 export const ScrollInput = z.object({
   kind: z.literal('scroll'),
@@ -184,6 +202,8 @@ export const ServerCalibrationMsg = z.object({
   screenRect: ScreenRect,
   windowInfo: WindowInfo,
   deviceLogical: DeviceLogical,
+  // Optional input fields this session's host honours (see INPUT_FEATURES).
+  features: z.array(z.string()).optional(),
 });
 export const ServerFrameMsg = z.object({
   type: z.literal('frame'),
@@ -421,6 +441,8 @@ export const HostSessionEventMsg = z.object({
       screenRect: ScreenRect.optional(),
       deviceLogical: DeviceLogical.optional(),
       message: z.string().optional(),
+      // On `ready`: optional input fields this host honours (see INPUT_FEATURES).
+      features: z.array(z.string()).optional(),
     })
     .optional(),
 });

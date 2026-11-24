@@ -44,6 +44,8 @@ interface SessionPipe {
   windowInfo: WindowInfo | null;
   screenRect: ScreenRect | null;
   deviceLogical: DeviceLogical | null;
+  /** Optional input fields this session's host honours; passed on to browsers. */
+  features: string[];
   lastFrame: string | null; // base64 — replayed to late joiners so the screen isn't blank
   state: SessionState;
   buildLog: BuildLogEntry[];
@@ -78,6 +80,7 @@ export class SessionProxy {
         windowInfo: null,
         screenRect: null,
         deviceLogical: null,
+        features: [],
         lastFrame: null,
         state: 'queued',
         buildLog: [],
@@ -125,6 +128,7 @@ export class SessionProxy {
         windowInfo: p.windowInfo,
         screenRect: p.screenRect,
         deviceLogical: p.deviceLogical,
+        features: p.features,
       });
     }
     if (p.lastFrame) {
@@ -182,12 +186,15 @@ export class SessionProxy {
     windowInfo: WindowInfo,
     screenRect: ScreenRect,
     deviceLogical: DeviceLogical,
+    features?: string[],
   ): void {
     const p = this.ensure(sessionId);
     p.windowInfo = windowInfo;
     p.screenRect = screenRect;
     p.deviceLogical = deviceLogical;
-    this.broadcast(p, { type: 'calibration', windowInfo, screenRect, deviceLogical });
+    // A recalibration without a list keeps what the host last reported.
+    if (features) p.features = features;
+    this.broadcast(p, { type: 'calibration', windowInfo, screenRect, deviceLogical, features: p.features });
   }
 
   pushFrame(sessionId: string, jpegBase64: string): void {
