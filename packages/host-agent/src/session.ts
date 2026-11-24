@@ -768,7 +768,7 @@ export class Session extends EventEmitter {
     switch (input.kind) {
       case 'tap': {
         const pt = windowNormToDeviceLogical(input.normX, input.normY, wi, sr, dl);
-        if (pt) await tap(this.udid, pt.x, pt.y);
+        if (pt) await tap(this.udid, pt.x, pt.y, input.durationMs);
         break;
       }
       case 'swipe': {
@@ -782,7 +782,7 @@ export class Session extends EventEmitter {
             x: clampPt(input.endX * dl.w, 0, dl.w),
             y: clampPt(input.endY * dl.h, 0, dl.h),
           };
-        await swipe(this.udid, start.x, start.y, end.x, end.y);
+        await swipe(this.udid, start.x, start.y, end.x, end.y, input.durationMs, input.endHoldMs);
         break;
       }
       case 'scroll':

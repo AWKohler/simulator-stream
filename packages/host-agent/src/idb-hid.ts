@@ -32,7 +32,9 @@ type HidPressAction = { touch: { point: GrpcPoint } } | { key: { keycode: number
 
 export type HidEvent =
   | { press: { action: HidPressAction; direction: 'DOWN' | 'UP' } }
-  | { swipe: { start: GrpcPoint; end: GrpcPoint; delta: number; duration: number } };
+  | { swipe: { start: GrpcPoint; end: GrpcPoint; delta: number; duration: number } }
+  // Seconds to wait before the next event (idb's own `tap --duration` uses it).
+  | { delay: { duration: number } };
 
 interface HidServiceClient extends grpc.Client {
   hid: (
@@ -125,6 +127,62 @@ export function tapEvents(x: number, y: number): HidEvent[] {
 
 export function swipeEvents(startX: number, startY: number, endX: number, endY: number): HidEvent[] {
   return [{ swipe: { start: { x: startX, y: startY }, end: { x: endX, y: endY }, delta: 0, duration: 0 } }];
+}
+
+function touch(direction: 'DOWN' | 'UP', x: number, y: number): HidEvent {
+  return { press: { action: { touch: { point: { x, y } } }, direction } };
+}
+
+function wait(ms: number): HidEvent {
+  return { delay: { duration: ms / 1000 } };
+}
+
+/** The longest any one gesture may keep a finger down. */
+const MAX_FINGER_MS = 4_000;
+
+/** A press held in place: finger down, wait, finger up. */
+export function holdEvents(x: number, y: number, durationMs: number): HidEvent[] {
+  const ms = Math.min(Math.max(durationMs, 0), MAX_FINGER_MS);
+  return [touch('DOWN', x, y), wait(ms), touch('UP', x, y)];
+}
+
+/**
+ * A swipe driven point by point, the way a finger moves: down at the start,
+ * a move about every 16 ms until the end is reached after `durationMs`, an
+ * optional rest at the end, then up.
+ *
+ * A finger that is still moving when it lifts flings the content; one that
+ * rested first leaves it where it is. During the rest the finger is nudged by
+ * a fraction of a point each frame, so the simulator keeps receiving touch
+ * moves and measures a speed of zero at release (a silent finger would still
+ * carry the speed of its last move).
+ */
+export function pacedSwipeEvents(
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+  durationMs: number,
+  endHoldMs = 0,
+): HidEvent[] {
+  const moving = Math.min(Math.max(durationMs, 32), MAX_FINGER_MS);
+  const rest = Math.min(Math.max(endHoldMs, 0), 1_000);
+  const steps = Math.max(2, Math.min(240, Math.round(moving / 16)));
+  const stepMs = moving / steps;
+  const events: HidEvent[] = [touch('DOWN', startX, startY)];
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    events.push(wait(stepMs), touch('DOWN', startX + (endX - startX) * t, startY + (endY - startY) * t));
+  }
+  if (rest >= 16) {
+    const frames = Math.max(2, Math.round(rest / 16));
+    for (let i = 1; i <= frames; i++) {
+      const nudge = i % 2 === 0 ? 0 : 0.2;
+      events.push(wait(rest / frames), touch('DOWN', endX, endY + nudge));
+    }
+  }
+  events.push(touch('UP', endX, endY));
+  return events;
 }
 
 export function keyEvents(keycode: number): HidEvent[] {

@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import { execAsSimUser, spawnAsSimUser, simUserEnabled } from './util.js';
 import { log, warn } from './log.js';
 import {
+  pacedSwipeEvents,
+  holdEvents,
   closeHidClient,
   keyEvents,
   sendHidEvents,
@@ -12,6 +14,7 @@ import {
   textEvents,
   type HidEvent,
 } from './idb-hid.js';
+import { MAX_GESTURE_MS } from '@sim/shared';
 
 // pip3/conda can install idb into various prefixes depending on the environment.
 const IDB_CANDIDATES = [
@@ -213,10 +216,11 @@ export function stopAllCompanions(): void {
 // (a missed tap shouldn't kill a session).
 // ──────────────────────────────────────────────────────────────────────────────
 
-async function idbCmd(udid: string, args: string, label: string): Promise<void> {
+async function idbCmd(udid: string, args: string, label: string, gestureMs = 0): Promise<void> {
   if (!idbBin) return;
   const cmd = `"${idbBin}" ${args} --udid ${udid}`;
-  const res = await execAsSimUser(cmd, { timeoutMs: 5_000 });
+  // A gesture with a duration runs for that long before idb returns.
+  const res = await execAsSimUser(cmd, { timeoutMs: 5_000 + gestureMs });
   if (res.code !== 0) {
     warn(`idb ${label} failed: ${(res.stderr || res.stdout).split('\n')[0]}`);
   }
@@ -233,7 +237,7 @@ const hidFastPathLogged = new Set<string>();
  * the caller uses the idb CLI instead) when there's no companion yet or the
  * call fails, so input keeps working — just slowly — if the fast path breaks.
  */
-async function sendViaCompanion(udid: string, events: HidEvent[], label: string): Promise<boolean> {
+async function sendViaCompanion(udid: string, events: HidEvent[], label: string, gestureMs = 0): Promise<boolean> {
   const entry = socketReady.get(udid);
   if (!entry || !companions.has(udid)) return false;
   const ready = await Promise.race([
@@ -243,7 +247,8 @@ async function sendViaCompanion(udid: string, events: HidEvent[], label: string)
   if (!ready) return false;
   try {
     const started = Date.now();
-    await sendHidEvents(companionSocketPath(udid), events);
+    // A paced or held gesture takes as long as it says before the companion answers.
+    await sendHidEvents(companionSocketPath(udid), events, 3_000 + gestureMs);
     if (!hidFastPathLogged.has(udid)) {
       hidFastPathLogged.add(udid);
       log(`idb ${label} via companion gRPC ok (${Date.now() - started}ms) for ${udid.slice(0, 6)}`);
@@ -259,20 +264,51 @@ async function sendViaCompanion(udid: string, events: HidEvent[], label: string)
   }
 }
 
-export async function tap(udid: string, x: number, y: number): Promise<void> {
-  if (await sendViaCompanion(udid, tapEvents(x, y), 'tap')) return;
-  await idbCmd(udid, `ui tap ${x} ${y}`, 'tap');
+/** idb takes durations in seconds; anything under a frame is left to its default. */
+function durationFlag(durationMs: number | undefined): string {
+  if (durationMs === undefined || !Number.isFinite(durationMs) || durationMs < 16) return '';
+  return ` --duration ${(Math.min(durationMs, MAX_GESTURE_MS) / 1000).toFixed(3)}`;
 }
 
+function gestureMs(...parts: Array<number | undefined>): number {
+  return parts.reduce<number>((sum, part) => sum + (Number.isFinite(part) ? Math.max(0, part as number) : 0), 0);
+}
+
+/** A tap, or with `durationMs` a press held that long (context menus, drag handles). */
+export async function tap(udid: string, x: number, y: number, durationMs?: number): Promise<void> {
+  const held = durationMs !== undefined && durationMs >= 16;
+  const events = held ? holdEvents(x, y, durationMs) : tapEvents(x, y);
+  if (await sendViaCompanion(udid, events, held ? 'hold' : 'tap', gestureMs(durationMs))) return;
+  await idbCmd(udid, `ui tap ${x} ${y}${durationFlag(durationMs)}`, 'tap', gestureMs(durationMs));
+}
+
+/**
+ * A swipe from start to end. With `durationMs` it is paced over that long, so
+ * the touch lets go at the speed the person's finger was moving. With
+ * `endHoldMs` the finger then rests before lifting, which stops a scroll
+ * where it is instead of flinging it on.
+ */
 export async function swipe(
   udid: string,
   startX: number,
   startY: number,
   endX: number,
   endY: number,
+  durationMs?: number,
+  endHoldMs?: number,
 ): Promise<void> {
-  if (await sendViaCompanion(udid, swipeEvents(startX, startY, endX, endY), 'swipe')) return;
-  await idbCmd(udid, `ui swipe ${startX} ${startY} ${endX} ${endY}`, 'swipe');
+  const timed = (durationMs !== undefined && durationMs >= 16) || (endHoldMs !== undefined && endHoldMs >= 16);
+  const events = timed
+    ? pacedSwipeEvents(startX, startY, endX, endY, durationMs ?? 0, endHoldMs ?? 0)
+    : swipeEvents(startX, startY, endX, endY);
+  if (await sendViaCompanion(udid, events, timed ? 'paced swipe' : 'swipe', gestureMs(durationMs, endHoldMs))) return;
+  // The CLI can pace a swipe but cannot rest at its end.
+  await idbCmd(
+    udid,
+    `ui swipe ${startX} ${startY} ${endX} ${endY}${durationFlag(durationMs)}`,
+    'swipe',
+    gestureMs(durationMs),
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
