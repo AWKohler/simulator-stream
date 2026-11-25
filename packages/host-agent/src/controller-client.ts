@@ -69,6 +69,38 @@ export class ControllerClient {
     this.ws?.close();
   }
 
+  /**
+   * The device families to offer this controller. A controller validates the
+   * greeting against the families its own protocol knows and ignores one it
+   * cannot parse — which would leave this host serving nothing, iPhone and
+   * iPad included. So anything beyond those two (the iPhone Duo) is offered
+   * only if the controller's /health says it knows it; an older controller,
+   * which says nothing, gets the two it has always had.
+   */
+  private async offeredDeviceModels(): Promise<DeviceModel[]> {
+    const base: DeviceModel[] = ['iPhone-16-Pro', 'iPad-Pro'];
+    const extra = this.opts.deviceModels.filter((m) => !base.includes(m));
+    if (extra.length === 0) return this.opts.deviceModels;
+    try {
+      const url = new URL(this.opts.url);
+      url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+      url.pathname = '/health';
+      url.search = '';
+      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      const body = (await res.json()) as { deviceModels?: unknown };
+      const known = Array.isArray(body.deviceModels) ? body.deviceModels : [];
+      const offered = this.opts.deviceModels.filter((m) => base.includes(m) || known.includes(m));
+      const withheld = extra.filter((m) => !offered.includes(m));
+      if (withheld.length > 0) {
+        warn(`Controller does not know ${withheld.join(', ')} (it is older than this agent); not offering it.`);
+      }
+      return offered;
+    } catch (e) {
+      warn(`Could not ask the controller which devices it knows (${(e as Error).message}); offering iPhone and iPad only.`);
+      return this.opts.deviceModels.filter((m) => base.includes(m));
+    }
+  }
+
   private connect(): void {
     if (this.closed) return;
     log(`Connecting to controller @ ${this.opts.url}`);
@@ -77,16 +109,19 @@ export class ControllerClient {
 
     ws.on('open', () => {
       log('Controller WS open');
-      this.send({
-        type: 'hello',
-        hostId: this.opts.hostId,
-        hostToken: this.opts.hostToken,
-        capacity: {
-          slots: this.opts.slots,
-          deviceModels: this.opts.deviceModels,
-          kind: this.opts.kind,
-        },
-        resources: collectResources(),
+      void this.offeredDeviceModels().then((deviceModels) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        this.send({
+          type: 'hello',
+          hostId: this.opts.hostId,
+          hostToken: this.opts.hostToken,
+          capacity: {
+            slots: this.opts.slots,
+            deviceModels,
+            kind: this.opts.kind,
+          },
+          resources: collectResources(),
+        });
       });
 
       // Heartbeats keep cloudflared's WS idle timeout from killing the conn

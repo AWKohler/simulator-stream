@@ -447,6 +447,12 @@ export const ClientCameraStateMsg = z.object({
   height: z.number().optional(),
 });
 
+// iPhone Duo: send each stream's picture so far again (its last keyframe and
+// what followed). For a client whose decoder had to start over — an app back
+// from the background, say — and would otherwise wait for the next keyframe,
+// which on a still panel is seconds away.
+export const ClientResyncVideoMsg = z.object({ type: z.literal('resync_video') });
+
 export const BrowserToServer = z.discriminatedUnion('type', [
   ClientInputMsg,
   ClientCalibrationSetMsg,
@@ -454,6 +460,7 @@ export const BrowserToServer = z.discriminatedUnion('type', [
   ClientPingMsg,
   ClientCameraStateMsg,
   ClientSetOrientationMsg,
+  ClientResyncVideoMsg,
 ]);
 export type BrowserToServer = z.infer<typeof BrowserToServer>;
 

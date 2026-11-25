@@ -73,6 +73,7 @@ const STATE_INTERVAL_MS = 33;
  * ready the instant the stream starts) waits this long after that.
  */
 const POSTURE_GRACE_MS = 900;
+const MAX_QUEUED_GESTURES = 24;
 
 export interface DuoRigEvents {
   onVideoConfig: (display: DuoDisplay, config: FramebufferVideoConfig) => void;
@@ -118,6 +119,9 @@ export class DuoRig {
   private touchIdleTimer: NodeJS.Timeout | null = null;
   /** Taps and swipes are replayed one after another, never interleaved. */
   private gestureQueue: Promise<void> = Promise.resolve();
+  /** Replayed gestures waiting or running. Past the limit new ones are dropped:
+   * each can last seconds, and nothing a person does queues this many. */
+  private gesturesQueued = 0;
   /** Posture inputs are held until this time (see POSTURE_GRACE_MS). */
   private postureAt = Number.POSITIVE_INFINITY;
   private heldPosture: { hinge?: { angle: number; instant: boolean }; orientation?: DeviceOrientation } = {};
@@ -130,16 +134,35 @@ export class DuoRig {
     private readonly events: DuoRigEvents,
   ) {}
 
+  /** A rig that has not started yet. Hold on to it, then `start()` it: that
+   * way it can be stopped at any point of a start-up that takes seconds. */
+  static create(udid: string, events: DuoRigEvents): DuoRig {
+    return new DuoRig(udid, events);
+  }
+
+  private assertRunning(): void {
+    if (this.stopped) throw new Error('Session ended while the iPhone Duo was starting.');
+  }
+
   /**
    * Find both panels, open the control helper, fold to the starting angle and
    * start a capturer per panel. Resolves once the helper is up and the
-   * capturers are started; `onReady` follows when both have a stream.
+   * capturers are started; `onReady` follows when both have a stream. If
+   * `stop()` is called meanwhile it stops at the next step and rejects, with
+   * nothing left running.
    */
-  static async start(udid: string, events: DuoRigEvents): Promise<DuoRig> {
-    const rig = new DuoRig(udid, events);
+  async start(): Promise<void> {
+    const rig = this;
+    const udid = this.udid;
     try {
       await rig.resolvePanels();
-      rig.control = await DuoControl.open(udid);
+      rig.assertRunning();
+      const control = await DuoControl.open(udid);
+      if (rig.stopped) {
+        control.close();
+        rig.assertRunning();
+      }
+      rig.control = control;
       rig.control.onHinge = (report) => {
         rig.hinge = { angle: report.angle, moving: report.moving };
         if (!report.moving) rig.hingeRest?.();
@@ -153,6 +176,7 @@ export class DuoRig {
       // A reused simulator may have been left turned by its last session.
       await rig.control.orientation('portrait');
       await rig.control.setHinge(0, true);
+      rig.assertRunning();
       if (START_ANGLE > 0) {
         // Wait for the fold to arrive (and iOS to light the inner screen)
         // before streaming, so the first picture a client sees is the right one.
@@ -164,20 +188,19 @@ export class DuoRig {
         rig.hingeRest = null;
         await sleep(350);
       }
-      if (rig.stopped) throw new Error('Session ended while the iPhone Duo was starting.');
+      rig.assertRunning();
       rig.startCapture();
     } catch (e) {
       rig.stop();
       throw e;
     }
-    return rig;
   }
 
   /** The panels' framebuffers appear a little after boot; wait for both. */
   private async resolvePanels(): Promise<void> {
     const deadline = Date.now() + 45_000;
     let lastError = 'the simulator has no displays yet';
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !this.stopped) {
       try {
         const displays = (await listFramebufferDisplays(this.udid)).filter((d) => d.width > 0 && d.height > 0);
         const uuids = await duoDisplayUUIDs(this.udid);
@@ -222,6 +245,7 @@ export class DuoRig {
       }
       await sleep(1000);
     }
+    this.assertRunning();
     throw new Error(`iPhone Duo displays did not come up: ${lastError}`);
   }
 
@@ -349,7 +373,7 @@ export class DuoRig {
           break;
         case 'tap': {
           const panel = this.panelFor(input.display);
-          await this.gesture(async () => {
+          await this.gesture(panel, async () => {
             await control.touch(panel.uuid, 'down', input.normX, input.normY);
             await sleep(Math.min(MAX_GESTURE_MS, input.durationMs ?? 60));
             await control.touch(panel.uuid, 'up', input.normX, input.normY);
@@ -423,8 +447,24 @@ export class DuoRig {
     return true;
   }
 
-  private gesture(run: () => Promise<void>): Promise<void> {
-    this.gestureQueue = this.gestureQueue.catch(() => undefined).then(run);
+  private gesture(panel: Panel, run: () => Promise<void>): Promise<void> {
+    if (this.gesturesQueued >= MAX_QUEUED_GESTURES) return Promise.resolve();
+    this.gesturesQueued++;
+    this.gestureQueue = this.gestureQueue
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.stopped) return;
+        try {
+          await run();
+        } catch (e) {
+          // Half a gesture must not leave a finger on the glass.
+          await this.control?.release(panel.uuid).catch(() => undefined);
+          throw e;
+        }
+      })
+      .finally(() => {
+        this.gesturesQueued--;
+      });
     return this.gestureQueue;
   }
 
@@ -460,7 +500,7 @@ export class DuoRig {
     if (!control) return Promise.resolve();
     const duration = Math.min(MAX_GESTURE_MS, Math.max(30, durationMs));
     const steps = Math.max(4, Math.min(120, Math.round(duration / 12)));
-    return this.gesture(async () => {
+    return this.gesture(panel, async () => {
       await control.touch(panel.uuid, 'down', x1, y1);
       for (let i = 1; i <= steps; i++) {
         await sleep(duration / steps);

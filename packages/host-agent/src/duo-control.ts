@@ -187,13 +187,28 @@ export class DuoControl {
     return this.send({ type: 'orientation', orientation });
   }
 
-  /** Keyboard usages as [usage, down] pairs, sent in order. */
-  keys(keys: Array<[number, boolean]>): Promise<void> {
-    if (keys.length === 0) return Promise.resolve();
-    return this.send({ type: 'keys', keys });
+  /**
+   * Keyboard usages as [usage, down] pairs, sent in order. A long run (a
+   * paste) goes as several commands: each is cut where no key is held, so a
+   * shifted character is never split from its shift.
+   */
+  async keys(keys: Array<[number, boolean]>): Promise<void> {
+    const MAX_PAIRS = 120;
+    let chunk: Array<[number, boolean]> = [];
+    const held = new Set<number>();
+    for (const pair of keys) {
+      chunk.push(pair);
+      if (pair[1]) held.add(pair[0]);
+      else held.delete(pair[0]);
+      if (chunk.length >= MAX_PAIRS && held.size === 0) {
+        await this.send({ type: 'keys', keys: chunk }, 15_000);
+        chunk = [];
+      }
+    }
+    if (chunk.length > 0) await this.send({ type: 'keys', keys: chunk }, 15_000);
   }
 
-  private send(payload: Record<string, unknown>): Promise<void> {
+  private send(payload: Record<string, unknown>, timeoutMs = 5000): Promise<void> {
     if (this.stopped) return Promise.reject(new Error('Duo helper is closed'));
     if (this.pending.size >= 512) return Promise.reject(new Error('Too many pending Duo commands'));
     const id = String(++this.nextID);
@@ -201,7 +216,7 @@ export class DuoControl {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('Duo helper command timed out'));
-      }, 5000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.process.stdin.write(JSON.stringify({ id, ...payload }) + '\n', (error) => {
         if (!error) return;

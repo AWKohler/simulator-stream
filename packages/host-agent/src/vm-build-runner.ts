@@ -776,11 +776,12 @@ function guestBuildScript(
   // Orientation overrides must match the local backend or the preview's rotate
   // control regresses for apps that don't declare orientations themselves.
   // (One difference is left for when a VM-building host first has the iPhone
-  // Duo: the local backend omits UIRequiresFullScreen for Duo sessions, since
-  // with it the Duo's inner screen will not turn upside down. Here the flag is
-  // always set, so a Duo would follow the user one way round only.)
+  // Duo: for a Duo session the local backend adds upside-down to the iPhone
+  // list and omits UIRequiresFullScreen, so the Duo's inner screen turns both
+  // ways round. Here neither is done yet, so a Duo would follow the user one
+  // way round only.)
   const orientationFlags = `INFOPLIST_KEY_UIRequiresFullScreen=YES \
-  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
+  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
   'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'`;
   // NOTE: every flavor builds UNSIGNED. The device .ipa is unsigned by design
   // (the Companion re-signs it with the user's own Apple ID), and the App Store

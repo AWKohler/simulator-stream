@@ -47,8 +47,12 @@ export function sessionRouter(orch: Orchestrator, options: SessionRouterOptions)
       res.status(400).json({ error: 'invalid request', details: parsed.error.format() });
       return;
     }
-    // A device no connected host can run would wait in the queue for ever.
-    if (!orch.supportsDeviceModel(parsed.data.deviceModel)) {
+    // A device only some hosts have (the iPhone Duo) and none connected has
+    // would wait in the queue for ever, so it is refused. The iPhone and the
+    // iPad, which every host has, still queue through a host's restart as
+    // they always did.
+    const everyHostHasIt = parsed.data.deviceModel === 'iPhone-16-Pro' || parsed.data.deviceModel === 'iPad-Pro';
+    if (!everyHostHasIt && !orch.supportsDeviceModel(parsed.data.deviceModel)) {
       res.status(409).json({
         error: `No simulator host here can run ${parsed.data.deviceModel}.`,
         code: 'device_unsupported',

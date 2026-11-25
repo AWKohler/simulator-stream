@@ -283,14 +283,14 @@ export function runBuild(options: BuildOptions): BuildHandle {
         // use). UIRequiresFullScreen is required so iPadOS doesn't reject the
         // geometry change in windowed/Stage-Manager mode. This affects the
         // simulator preview build only — never the user's device/App Store build.
-        // Upside-down is on the iPhone list for the iPhone Duo: turned one way,
-        // its inner screen's interface is upside down in that panel's own terms.
-        // (An iPhone with Face ID never turns upside down, whatever is listed.)
-        // The Duo also goes without UIRequiresFullScreen: with it, iOS refuses
-        // that upside-down turn on the inner screen (seen on iOS 27.1), so the
-        // device would follow the user one way round and not the other.
+        // The iPhone Duo's build differs in two ways, both so that its inner
+        // screen follows the user whichever way round the device is turned:
+        // upside-down joins the iPhone list (turned one way, that screen's
+        // interface is upside down in the panel's own terms), and
+        // UIRequiresFullScreen is left out (with it, iOS refuses that turn;
+        // seen on iOS 27.1). Builds for the iPhone and the iPad are unchanged.
         ...(isDuo ? [] : ['INFOPLIST_KEY_UIRequiresFullScreen=YES']),
-        'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
+        `INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait${isDuo ? ' UIInterfaceOrientationPortraitUpsideDown' : ''} UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight`,
         'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
         'build',
       ];

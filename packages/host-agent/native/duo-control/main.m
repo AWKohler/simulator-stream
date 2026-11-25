@@ -373,10 +373,36 @@ static NSString *Button(NSDictionary *command) {
 // `keys` is a list of [usage, down] pairs from the keyboard usage page, sent in
 // order with a short gap so each stroke is seen as its own event.
 
+// Keys still to send, and when the next one is due. Commands add to the end;
+// a timer drains it, so a long run of keys never holds up the hinge or a touch.
+static NSMutableArray<NSArray *> *gKeyQueue;      // [usage, down, commandID or NSNull (set on a command's last key)]
+static BOOL gKeyTimerRunning;
+
+static void DrainKeys(void) {
+  if (gKeyQueue.count == 0) {
+    gKeyTimerRunning = NO;
+    return;
+  }
+  NSArray *next = gKeyQueue.firstObject;
+  [gKeyQueue removeObjectAtIndex:0];
+  HIDEvent event = KeyboardEventFn(kCFAllocatorDefault, mach_absolute_time(), 0x07,
+                                   (uint32_t)[next[0] intValue], [next[1] boolValue], 0);
+  if (event) {
+    DispatchFn(gClient, event);
+    CFRelease(event);
+  }
+  // The command is answered when its last key has gone.
+  if (next[2] != [NSNull null]) ReplyOK(next[2]);
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{ DrainKeys(); });
+}
+
+/// Queues the keys. Returns an error, or nil — in which case the reply is sent
+/// once the last of them has been dispatched.
 static NSString *Keys(NSDictionary *command) {
   if (!KeyboardEventFn) return @"Simulator keyboard API is unavailable";
   NSArray *keys = [command[@"keys"] isKindOfClass:NSArray.class] ? command[@"keys"] : nil;
-  if (!keys || keys.count > 4096) return @"Expected keys: a list of [usage, down] pairs";
+  if (!keys || keys.count == 0 || keys.count > 4096) return @"Expected keys: a list of [usage, down] pairs";
+  if (gKeyQueue.count > 16384) return @"Too many keys waiting";
   for (id pair in keys) {
     if (![pair isKindOfClass:NSArray.class] || [pair count] != 2 ||
         ![pair[0] isKindOfClass:NSNumber.class] || ![pair[1] isKindOfClass:NSNumber.class]) {
@@ -385,13 +411,15 @@ static NSString *Keys(NSDictionary *command) {
     int usage = [pair[0] intValue];
     if (usage < 0 || usage > 0xE7) return @"Keyboard usage out of range";
   }
-  for (NSArray *pair in keys) {
-    HIDEvent event = KeyboardEventFn(kCFAllocatorDefault, mach_absolute_time(), 0x07,
-                                     (uint32_t)[pair[0] intValue], [pair[1] boolValue], 0);
-    if (!event) return @"Key dispatch failed";
-    DispatchFn(gClient, event);
-    CFRelease(event);
-    usleep(1500);
+  if (!gKeyQueue) gKeyQueue = [NSMutableArray array];
+  id commandID = command[@"id"] ?: [NSNull null];
+  for (NSUInteger i = 0; i < keys.count; i++) {
+    NSArray *pair = keys[i];
+    [gKeyQueue addObject:@[pair[0], pair[1], i == keys.count - 1 ? commandID : [NSNull null]]];
+  }
+  if (!gKeyTimerRunning) {
+    gKeyTimerRunning = YES;
+    DrainKeys();
   }
   return nil;
 }
@@ -429,7 +457,7 @@ static void HandleCommand(NSDictionary *command) {
     if (error) ReplyError(commandID, error); else ReplyOK(commandID);
   } else if ([type isEqual:@"keys"]) {
     NSString *error = Keys(command);
-    if (error) ReplyError(commandID, error); else ReplyOK(commandID);
+    if (error) ReplyError(commandID, error);   // (success is answered when the keys have gone)
   } else if ([type isEqual:@"displays"]) {
     ResolvePanels();
     NSMutableArray *list = [NSMutableArray array];
@@ -465,11 +493,17 @@ int main(int argc, char **argv) {
       size_t capacity = 0;
       ssize_t length;
       while ((length = getline(&line, &capacity, stdin)) > 0) {
-        if (length > 4096) {
-          dispatch_async(dispatch_get_main_queue(), ^{ ReplyError(nil, @"Command is too large"); });
+        NSData *data = [NSData dataWithBytes:line length:(NSUInteger)length];
+        if (length > 65536) {
+          // Too large to act on, but say which command it was if that can be read.
+          dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *text = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, 256)] encoding:NSUTF8StringEncoding];
+            NSRange found = text ? [text rangeOfString:@"\"id\":\"[^\"]{1,32}\"" options:NSRegularExpressionSearch] : NSMakeRange(NSNotFound, 0);
+            id commandID = found.location == NSNotFound ? nil : [text substringWithRange:NSMakeRange(found.location + 6, found.length - 7)];
+            ReplyError(commandID, @"Command is too large");
+          });
           continue;
         }
-        NSData *data = [NSData dataWithBytes:line length:(NSUInteger)length];
         dispatch_async(dispatch_get_main_queue(), ^{
           id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
           if ([parsed isKindOfClass:NSDictionary.class]) HandleCommand(parsed);

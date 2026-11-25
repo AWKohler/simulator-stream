@@ -584,33 +584,38 @@ export class Session extends EventEmitter {
    */
   private async startDuoCapture(): Promise<void> {
     this.setPhase('capturing');
+    // Held from before it starts, so that stopping the session during the
+    // seconds a Duo takes to come up stops this too (see `stop`).
+    const rig = DuoRig.create(this.udid, {
+      onVideoConfig: (display, config) => this.emit('videoConfig', config, display),
+      onVideoChunk: (display, chunk) => this.emit('videoChunk', chunk, display),
+      onState: (state) => this.emit('duoState', state),
+      onReady: () => {
+        const duo = this.duo;
+        if (!duo || this.phase === 'ending' || this.phase === 'ended') return;
+        // The single-screen fields describe the inner panel; clients that
+        // know the Duo read both panels from `duo_state` instead.
+        const size = duo.primaryPanelSize();
+        this.deviceLogical = { w: Math.round(size.width / size.scale), h: Math.round(size.height / size.scale) };
+        this.windowInfo = { id: 0, x: 0, y: 0, w: size.width, h: size.height, scale: 1 };
+        this.screenRect = { left: 0, top: 0, right: size.width, bottom: size.height };
+        this.setPhase('ready', {
+          windowInfo: this.windowInfo,
+          screenRect: this.screenRect,
+          deviceLogical: this.deviceLogical,
+        });
+      },
+      onFatal: (message) => {
+        if (this.phase === 'ending' || this.phase === 'ended' || this.phase === 'error') return;
+        err(`duo session ${this.sessionId.slice(0, 8)}: ${message}`);
+        this.setPhase('error', { message });
+      },
+    });
+    this.duo = rig;
     try {
-      this.duo = await DuoRig.start(this.udid, {
-        onVideoConfig: (display, config) => this.emit('videoConfig', config, display),
-        onVideoChunk: (display, chunk) => this.emit('videoChunk', chunk, display),
-        onState: (state) => this.emit('duoState', state),
-        onReady: () => {
-          const duo = this.duo;
-          if (!duo || this.phase === 'ending' || this.phase === 'ended') return;
-          // The single-screen fields describe the inner panel; clients that
-          // know the Duo read both panels from `duo_state` instead.
-          const size = duo.primaryPanelSize();
-          this.deviceLogical = { w: Math.round(size.width / size.scale), h: Math.round(size.height / size.scale) };
-          this.windowInfo = { id: 0, x: 0, y: 0, w: size.width, h: size.height, scale: 1 };
-          this.screenRect = { left: 0, top: 0, right: size.width, bottom: size.height };
-          this.setPhase('ready', {
-            windowInfo: this.windowInfo,
-            screenRect: this.screenRect,
-            deviceLogical: this.deviceLogical,
-          });
-        },
-        onFatal: (message) => {
-          if (this.phase === 'ending' || this.phase === 'ended' || this.phase === 'error') return;
-          err(`duo session ${this.sessionId.slice(0, 8)}: ${message}`);
-          this.setPhase('error', { message });
-        },
-      });
+      await rig.start();
     } catch (e) {
+      if (this.duo === rig) this.duo = null;
       if (this.phase === 'ending' || this.phase === 'ended') return;
       this.setPhase('error', { message: (e as Error).message });
     }

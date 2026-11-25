@@ -7,6 +7,7 @@ import { sessionRouter } from './routes/sessions.js';
 import { deviceBuildRouter } from './routes/device-builds.js';
 import { appStoreBuildRouter } from './routes/app-store-builds.js';
 import { attachWS } from './routes/ws.js';
+import { DeviceModel } from '@sim/shared';
 import { log } from './log.js';
 
 const PORT = parseInt(process.env.PORT ?? '8080', 10);
@@ -42,6 +43,10 @@ app.use(
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
+    // The device families this controller's protocol knows. A host agent
+    // reads it before greeting, and offers nothing a controller older than
+    // itself would reject the greeting for.
+    deviceModels: DeviceModel.options,
     hosts: orch.listHosts().map((h) => ({
       id: h.hostId,
       slots: h.slots,

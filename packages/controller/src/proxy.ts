@@ -170,15 +170,7 @@ export class SessionProxy {
     for (const config of Object.values(p.duoVideoConfigs)) {
       if (config) send(ws, { type: 'video_config', ...config });
     }
-    for (const gop of p.gops.values()) {
-      for (const packet of gop.chunks) {
-        try {
-          ws.send(packet);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
+    this.replayVideo(sessionId, ws);
     // Replay buffered build log + last status so a late-joining UI rebuilds context.
     for (const entry of p.buildLog) {
       send(ws, { type: 'build_log', line: entry.line, stream: entry.stream });
@@ -203,6 +195,21 @@ export class SessionProxy {
       send(ws, { type: 'orientation', orientation: p.orientation });
     }
     send(ws, { type: 'state', state: p.state });
+  }
+
+  /** Send one browser each cached stream's picture so far (see GopCache). */
+  replayVideo(sessionId: string, ws: WebSocket): void {
+    const p = this.pipes.get(sessionId);
+    if (!p) return;
+    for (const gop of p.gops.values()) {
+      for (const packet of gop.chunks) {
+        try {
+          ws.send(packet);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   detachBrowser(sessionId: string, ws: WebSocket): void {

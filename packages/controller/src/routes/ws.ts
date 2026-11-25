@@ -420,6 +420,9 @@ function handleSessionConnection(
           orientation: msg.orientation,
         });
         break;
+      case 'resync_video':
+        proxy.replayVideo(sessionId, ws);
+        break;
       case 'ping':
         try {
           ws.send(JSON.stringify({ type: 'pong' }));
