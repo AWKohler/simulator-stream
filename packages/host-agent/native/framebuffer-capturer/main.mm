@@ -66,12 +66,24 @@ static BOOL HasArg(NSArray<NSString *> *args, NSString *name) {
 
 static BOOL LoadPrivateFrameworks(NSString **error) {
   const char *core = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator";
-  const char *kit = "/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit";
+  // SimulatorKit lives in Developer/Library/PrivateFrameworks up to Xcode 26
+  // and in Contents/SharedFrameworks from Xcode 27.
+  const char *kits[] = {
+    "/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit",
+    "/Applications/Xcode.app/Contents/SharedFrameworks/SimulatorKit.framework/SimulatorKit",
+  };
   if (!dlopen(core, RTLD_NOW | RTLD_GLOBAL)) {
     if (error) *error = [NSString stringWithFormat:@"dlopen CoreSimulator failed: %s", dlerror()];
     return NO;
   }
-  if (!dlopen(kit, RTLD_NOW | RTLD_GLOBAL)) {
+  BOOL kitLoaded = NO;
+  for (const char *kit : kits) {
+    if (dlopen(kit, RTLD_NOW | RTLD_GLOBAL)) {
+      kitLoaded = YES;
+      break;
+    }
+  }
+  if (!kitLoaded) {
     if (error) *error = [NSString stringWithFormat:@"dlopen SimulatorKit failed: %s", dlerror()];
     return NO;
   }

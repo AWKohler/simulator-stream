@@ -78,7 +78,12 @@ export function detect(): { hasIDB: boolean; idbBin: string | null; companionBin
     }
   }
 
+  // An explicit companion wins (e.g. a wrapper that points an old
+  // idb_companion at Xcode 27's moved SimulatorKit).
+  const explicit = process.env.SIM_COMPANION_BIN;
+  if (explicit && existsSync(explicit)) companionBin = explicit;
   for (const c of COMPANION_CANDIDATES) {
+    if (companionBin) break;
     if (existsSync(c)) {
       companionBin = c;
       break;

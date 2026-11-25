@@ -32,6 +32,7 @@ interface SimctlRuntime {
   isAvailable: boolean;
   version: string;
   name: string;
+  supportedDeviceTypes?: Array<{ identifier: string }>;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -68,6 +69,22 @@ function listIOSRuntimes(): SimctlRuntime[] {
     runtimes: SimctlRuntime[];
   };
   return json.runtimes.filter((r) => r.isAvailable && r.identifier.includes('iOS'));
+}
+
+/**
+ * The newest installed iOS runtime that can run `deviceType`. The newest
+ * runtime overall is not always it: Xcode 27.1's iOS 27.1 runtime supports
+ * only the iPhone Duo, so an iPhone 16 Pro has to use iOS 27.0.
+ */
+function runtimeFor(deviceType: string): string | null {
+  const runtimes = listIOSRuntimes().sort((a, b) =>
+    b.version.localeCompare(a.version, undefined, { numeric: true }),
+  );
+  const supporting = runtimes.find((r) =>
+    r.supportedDeviceTypes?.some((t) => t.identifier === deviceType),
+  );
+  // Older simctl output has no supportedDeviceTypes: fall back to the newest.
+  return (supporting ?? runtimes[0])?.identifier ?? null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -162,22 +179,23 @@ export async function ensurePool(slots: number): Promise<string[]> {
   const byName = new Map(existing.map((d) => [d.name, d]));
 
   // Find a usable iOS runtime once.
-  let runtimeId: string | null = null;
-  const runtimes = listIOSRuntimes();
-  if (runtimes.length === 0) {
+  if (listIOSRuntimes().length === 0) {
     throw new Error('No iOS simulator runtime is installed. Open Xcode and install one.');
   }
-  // Prefer the highest-version runtime.
-  runtimes.sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
-  runtimeId = runtimes[0].identifier;
+  const runtimeId = runtimeFor(DEVICE_TYPE);
 
   const udids: string[] = [];
   for (let i = 0; i < slots; i++) {
     const name = `${POOL_PREFIX}${i}`;
     const present = byName.get(name);
-    if (present) {
+    if (present?.isAvailable) {
       udids.push(present.udid);
       continue;
+    }
+    if (present) {
+      // Left behind by an Xcode whose runtime is gone: it can never boot.
+      log(`Replacing unavailable pool device ${name} (${present.udid.slice(0, 8)})...`);
+      await execAsSimUser(`xcrun simctl delete ${present.udid}`, { timeoutMs: 30_000 });
     }
     log(`Creating pool device ${name} (runtime ${runtimeId})...`);
     const res = await execAsSimUser(
@@ -317,11 +335,10 @@ export async function recreatePoolDevice(
     warn(`delete ${udid.slice(0, 8)} failed: ${(delRes.stderr || delRes.stdout).split('\n')[0]}`);
     return null;
   }
-  const runtimes = listIOSRuntimes();
-  if (runtimes.length === 0) return null;
-  runtimes.sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
+  const runtimeId = runtimeFor(targetType);
+  if (!runtimeId) return null;
   const createRes = await execAsSimUser(
-    `xcrun simctl create "${name}" "${targetType}" "${runtimes[0].identifier}"`,
+    `xcrun simctl create "${name}" "${targetType}" "${runtimeId}"`,
   );
   if (createRes.code !== 0) {
     warn(`recreate ${name} failed: ${(createRes.stderr || createRes.stdout).split('\n')[0]}`);
