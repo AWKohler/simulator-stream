@@ -92,6 +92,9 @@ interface SessionPipe {
 
 const IDLE_GRACE_MS = parseInt(process.env.SESSION_IDLE_GRACE_MS ?? '60000', 10);
 
+/** A browser with more than this still unsent is not given a replay on top. */
+const REPLAY_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+
 export class SessionProxy {
   private pipes = new Map<string, SessionPipe>();
 
@@ -197,10 +200,17 @@ export class SessionProxy {
     send(ws, { type: 'state', state: p.state });
   }
 
-  /** Send one browser each cached stream's picture so far (see GopCache). */
-  replayVideo(sessionId: string, ws: WebSocket): void {
+  /**
+   * Send one browser each cached stream's picture so far (see GopCache).
+   * Not to a browser that is already far behind on what it has been sent:
+   * a replay is megabytes, and one that asks again and again while reading
+   * slowly would otherwise pile them up here. It is told nothing; the next
+   * keyframe reaches it in its turn. Returns whether the replay was sent.
+   */
+  replayVideo(sessionId: string, ws: WebSocket): boolean {
     const p = this.pipes.get(sessionId);
-    if (!p) return;
+    if (!p) return false;
+    if (ws.bufferedAmount > REPLAY_MAX_PENDING_BYTES) return false;
     for (const gop of p.gops.values()) {
       for (const packet of gop.chunks) {
         try {
@@ -210,6 +220,7 @@ export class SessionProxy {
         }
       }
     }
+    return true;
   }
 
   detachBrowser(sessionId: string, ws: WebSocket): void {

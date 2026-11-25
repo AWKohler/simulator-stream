@@ -219,7 +219,14 @@ export class Session extends EventEmitter {
     return this.phase === 'ready';
   }
 
+  /** Set once by stop(), never cleared: the one fact about a session that
+   * work still in flight (a build, a boot, an install) cannot overwrite. */
+  private stopping = false;
+
   private setPhase(p: SessionPhase, payload?: SessionReadyPayload | { message: string }): void {
+    // A stopped session only ends. Whatever a continuation of earlier work
+    // would report ("installing", "ready", "boot timed out") is not true of it.
+    if (this.stopping && p !== 'ending' && p !== 'ended') return;
     this.phase = p;
     this.emit('phase', p, payload);
   }
@@ -231,7 +238,7 @@ export class Session extends EventEmitter {
   /** The session is being, or has been, torn down. (A method, so that a
    * check made before an await is not assumed to hold after it.) */
   private isOver(): boolean {
-    return this.phase === 'ending' || this.phase === 'ended';
+    return this.stopping || this.phase === 'ending' || this.phase === 'ended';
   }
 
   private get isDuo(): boolean {
@@ -494,15 +501,20 @@ export class Session extends EventEmitter {
       }
     }
 
+    // Stopped while it built or booted: the simulator is on its way back to
+    // the pool, and nothing more is to be done to it.
+    if (this.isOver()) return;
     this.setPhase('installing');
     try {
       await installAndLaunch(this.udid, result.appBundlePath, result.bundleId, this.camera);
     } catch (e) {
+      if (this.isOver()) return;
       const msg = (e as Error).message;
       this.emit('build', { event: 'failed', message: msg });
       if (isFirstBuild) this.setPhase('error', { message: msg });
       return;
     }
+    if (this.isOver()) return;
 
     if (!isFirstBuild) {
       // Re-build on an already-streaming session: simulator + capturer keep
@@ -955,7 +967,8 @@ export class Session extends EventEmitter {
   }
 
   async stop(): Promise<void> {
-    if (this.phase === 'ended' || this.phase === 'ending') return;
+    if (this.stopping || this.phase === 'ended' || this.phase === 'ending') return;
+    this.stopping = true;
     this.setPhase('ending');
     if (this.currentBuild) {
       this.currentBuild.cancel();

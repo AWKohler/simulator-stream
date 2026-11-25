@@ -33,6 +33,9 @@ export interface ControllerHandlers {
 
 export type ControllerToHostCmd = ReturnType<typeof ControllerToHost.parse>;
 
+/** How many rounds of an unanswered /health before connecting anyway. */
+const MAX_UNANSWERED_ROUNDS = 3;
+
 export class ControllerClient {
   private ws: WebSocket | null = null;
   private opts: Required<ControllerClientOptions>;
@@ -43,6 +46,8 @@ export class ControllerClient {
   private closed = false;
   /** Asking the controller what it knows, before opening a socket. */
   private connecting = false;
+  /** Rounds in a row in which the controller's /health gave no answer. */
+  private unanswered = 0;
 
   constructor(
     opts: ControllerClientOptions,
@@ -79,23 +84,26 @@ export class ControllerClient {
    * only if the controller's /health says it knows it; an older controller,
    * which says nothing, gets the two it has always had.
    */
-  private async offeredDeviceModels(): Promise<DeviceModel[]> {
+  private async offeredDeviceModels(): Promise<DeviceModel[] | null> {
     const base: DeviceModel[] = ['iPhone-16-Pro', 'iPad-Pro'];
     const extra = this.opts.deviceModels.filter((m) => !base.includes(m));
     if (extra.length === 0) return this.opts.deviceModels;
-    const url = new URL(this.opts.url);
-    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-    url.pathname = '/health';
-    url.search = '';
     let failure = '';
     // One slow answer should not cost the Duo until the next reconnect.
     for (let attempt = 0; attempt < 3 && !this.closed; attempt++) {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 700));
       try {
+        const url = new URL(this.opts.url);
+        url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+        url.pathname = '/health';
+        url.search = '';
         const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        // (A controller that is starting or failing says nothing about what it knows.)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json()) as { deviceModels?: unknown };
         const known = Array.isArray(body.deviceModels) ? body.deviceModels : [];
         const offered = this.opts.deviceModels.filter((m) => base.includes(m) || known.includes(m));
+        this.unanswered = 0;
         const withheld = extra.filter((m) => !offered.includes(m));
         if (withheld.length > 0) {
           warn(`Controller does not know ${withheld.join(', ')} (it is older than this agent); not offering it.`);
@@ -104,6 +112,15 @@ export class ControllerClient {
       } catch (e) {
         failure = (e as Error).message;
       }
+    }
+    // No answer. A controller that cannot be asked can rarely be connected to
+    // either, so try again shortly rather than register without the Duo and
+    // stay that way; if it keeps on not answering, connect with what every
+    // controller knows.
+    if (this.unanswered < MAX_UNANSWERED_ROUNDS) {
+      this.unanswered++;
+      warn(`Could not ask the controller which devices it knows (${failure}); trying again.`);
+      return null;
     }
     warn(`Could not ask the controller which devices it knows (${failure}); offering iPhone and iPad only.`);
     return this.opts.deviceModels.filter((m) => base.includes(m));
@@ -121,7 +138,9 @@ export class ControllerClient {
     this.connecting = true;
     void this.offeredDeviceModels().then((deviceModels) => {
       this.connecting = false;
-      if (!this.closed) this.open(deviceModels);
+      if (this.closed) return;
+      if (deviceModels) this.open(deviceModels);
+      else this.scheduleReconnect();
     });
   }
 

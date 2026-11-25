@@ -367,6 +367,7 @@ function handleSessionConnection(
 
   // Subscribe to orchestrator events for queue position updates & terminal state.
   let lastResyncAt = 0;
+  let resyncTimer: NodeJS.Timeout | null = null;
   const unsub = orch.onSessionEvent(sessionId, (rec) => {
     proxy.updateState(
       rec.sessionId,
@@ -423,10 +424,19 @@ function handleSessionConnection(
         break;
       case 'resync_video': {
         // Each replay can be megabytes: no more than one a second per browser.
-        const now = Date.now();
-        if (now - lastResyncAt >= 1000) {
-          lastResyncAt = now;
+        // One asked for sooner is sent when the second is up, not dropped: the
+        // viewer has thrown its decoders away and a still screen may not send
+        // another keyframe for seconds.
+        const wait = lastResyncAt + 1000 - Date.now();
+        if (wait <= 0) {
+          lastResyncAt = Date.now();
           proxy.replayVideo(sessionId, ws);
+        } else if (!resyncTimer) {
+          resyncTimer = setTimeout(() => {
+            resyncTimer = null;
+            lastResyncAt = Date.now();
+            proxy.replayVideo(sessionId, ws);
+          }, wait);
         }
         break;
       }
@@ -442,6 +452,7 @@ function handleSessionConnection(
 
   ws.on('close', () => {
     unsub();
+    if (resyncTimer) clearTimeout(resyncTimer);
     proxy.detachBrowser(sessionId, ws);
   });
 }

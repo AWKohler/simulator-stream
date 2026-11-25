@@ -460,7 +460,10 @@ export class DuoRig {
    * Enter pressed during the paste would land in the middle of it.
    */
   private typeKeys(strokes: Array<[number, boolean]>): Promise<void> {
-    if (this.keysQueued >= MAX_QUEUED_KEY_RUNS) return Promise.resolve();
+    if (this.keysQueued >= MAX_QUEUED_KEY_RUNS) {
+      warn(`${strokes.length} key events dropped: ${this.keysQueued} runs of typing are already waiting.`);
+      return Promise.resolve();
+    }
     this.keysQueued++;
     const run = this.keyQueue
       .catch(() => undefined)
