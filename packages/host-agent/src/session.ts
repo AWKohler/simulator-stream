@@ -662,7 +662,9 @@ export class Session extends EventEmitter {
     try {
       await rig.start();
     } catch (e) {
-      if (this.duo === rig) this.duo = null;
+      // A rig that was replaced has nothing to say about the session.
+      if (this.duo !== rig) return;
+      this.duo = null;
       if (this.isOver()) return;
       this.setPhase('error', { message: (e as Error).message });
     }
