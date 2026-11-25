@@ -74,6 +74,7 @@ const STATE_INTERVAL_MS = 33;
  */
 const POSTURE_GRACE_MS = 900;
 const MAX_QUEUED_GESTURES = 24;
+const MAX_QUEUED_KEY_RUNS = 64;
 
 export interface DuoRigEvents {
   onVideoConfig: (display: DuoDisplay, config: FramebufferVideoConfig) => void;
@@ -122,6 +123,9 @@ export class DuoRig {
   /** Replayed gestures waiting or running. Past the limit new ones are dropped:
    * each can last seconds, and nothing a person does queues this many. */
   private gesturesQueued = 0;
+  /** Typed text and keys, sent one run after another (see typeKeys). */
+  private keyQueue: Promise<void> = Promise.resolve();
+  private keysQueued = 0;
   /** Posture inputs are held until this time (see POSTURE_GRACE_MS). */
   private postureAt = Number.POSITIVE_INFINITY;
   private heldPosture: { hinge?: { angle: number; instant: boolean }; orientation?: DeviceOrientation } = {};
@@ -163,19 +167,20 @@ export class DuoRig {
         rig.assertRunning();
       }
       rig.control = control;
-      rig.control.onHinge = (report) => {
+      control.onHinge = (report) => {
         rig.hinge = { angle: report.angle, moving: report.moving };
         if (!report.moving) rig.hingeRest?.();
         rig.scheduleState();
       };
-      rig.control.onExit = (reason) => {
+      control.onExit = (reason) => {
         if (!rig.stopped) rig.events.onFatal(reason);
       };
       // The simulator boots shut. Say so first (the helper cannot read the
       // hinge), then ease to the starting angle so iOS sees a fold it can follow.
       // A reused simulator may have been left turned by its last session.
-      await rig.control.orientation('portrait');
-      await rig.control.setHinge(0, true);
+      await control.orientation('portrait');
+      rig.assertRunning();
+      await control.setHinge(0, true);
       rig.assertRunning();
       if (START_ANGLE > 0) {
         // Wait for the fold to arrive (and iOS to light the inner screen)
@@ -183,16 +188,18 @@ export class DuoRig {
         const rested = new Promise<void>((resolve) => {
           rig.hingeRest = resolve;
         });
-        await rig.control.setHinge(START_ANGLE);
+        await control.setHinge(START_ANGLE);
         await Promise.race([rested, sleep(2500)]);
         rig.hingeRest = null;
+        rig.assertRunning();
         await sleep(350);
       }
       rig.assertRunning();
       rig.startCapture();
     } catch (e) {
+      const ended = rig.stopped;
       rig.stop();
-      throw e;
+      throw ended ? new Error('Session ended while the iPhone Duo was starting.') : e;
     }
   }
 
@@ -396,13 +403,13 @@ export class DuoRig {
         }
         case 'text': {
           const strokes = textKeyStrokes(input.text);
-          if (strokes) await control.keys(strokes);
+          if (strokes) await this.typeKeys(strokes);
           else warn('duo: text has a character with no key mapping; dropped');
           break;
         }
         case 'key': {
           const code = hidCodeForKey(input.key);
-          if (code !== null) await control.keys([[code, true], [code, false]]);
+          if (code !== null) await this.typeKeys([[code, true], [code, false]]);
           break;
         }
       }
@@ -445,6 +452,24 @@ export class DuoRig {
       }, Math.max(0, wait));
     }
     return true;
+  }
+
+  /**
+   * Keys go to the helper strictly in the order they were typed. A long paste
+   * is sent in pieces, and inputs are handled as they arrive: without this an
+   * Enter pressed during the paste would land in the middle of it.
+   */
+  private typeKeys(strokes: Array<[number, boolean]>): Promise<void> {
+    if (this.keysQueued >= MAX_QUEUED_KEY_RUNS) return Promise.resolve();
+    this.keysQueued++;
+    const run = this.keyQueue
+      .catch(() => undefined)
+      .then(() => (this.stopped || !this.control ? undefined : this.control.keys(strokes)))
+      .finally(() => {
+        this.keysQueued--;
+      });
+    this.keyQueue = run;
+    return run;
   }
 
   private gesture(panel: Panel, run: () => Promise<void>): Promise<void> {
@@ -524,8 +549,14 @@ export class DuoRig {
     acc.x = x;
     acc.y = y;
     if (acc.timer) return;
+    // Nobody awaits a wheel scroll: a failure (the session ending mid-swipe,
+    // the helper going away) must end here, not as an unhandled rejection.
+    const scrollFailed = (e: unknown): void => {
+      if (!this.stopped) warn(`duo scroll failed: ${(e as Error).message}`);
+    };
     acc.timer = setTimeout(() => {
       acc.timer = null;
+      if (this.stopped) return;
       const { dx, dy, x: ax, y: ay } = acc;
       acc.dx = 0;
       acc.dy = 0;
@@ -539,11 +570,11 @@ export class DuoRig {
       if (distY >= distX) {
         const dir = dy > 0 ? -1 : 1;
         const half = (dir * distY) / logicalH / 2;
-        void this.swipe(panel, ax, clamp(ay - half), ax, clamp(ay + half));
+        this.swipe(panel, ax, clamp(ay - half), ax, clamp(ay + half)).catch(scrollFailed);
       } else {
         const dir = dx > 0 ? -1 : 1;
         const half = (dir * distX) / logicalW / 2;
-        void this.swipe(panel, clamp(ax - half), ay, clamp(ax + half), ay);
+        this.swipe(panel, clamp(ax - half), ay, clamp(ax + half), ay).catch(scrollFailed);
       }
     }, 80);
   }

@@ -228,6 +228,12 @@ export class Session extends EventEmitter {
     return this.currentOrientation;
   }
 
+  /** The session is being, or has been, torn down. (A method, so that a
+   * check made before an await is not assumed to hold after it.) */
+  private isOver(): boolean {
+    return this.phase === 'ending' || this.phase === 'ended';
+  }
+
   private get isDuo(): boolean {
     return this.deviceModel === 'iPhone-Duo';
   }
@@ -583,6 +589,9 @@ export class Session extends EventEmitter {
    * once both streams have a configuration.
    */
   private async startDuoCapture(): Promise<void> {
+    // The session may have been stopped during the boot or install that led
+    // here: then there is nothing to start, and the phase is not to be touched.
+    if (this.isOver()) return;
     this.setPhase('capturing');
     // Held from before it starts, so that stopping the session during the
     // seconds a Duo takes to come up stops this too (see `stop`).
@@ -592,7 +601,7 @@ export class Session extends EventEmitter {
       onState: (state) => this.emit('duoState', state),
       onReady: () => {
         const duo = this.duo;
-        if (!duo || this.phase === 'ending' || this.phase === 'ended') return;
+        if (!duo || this.isOver()) return;
         // The single-screen fields describe the inner panel; clients that
         // know the Duo read both panels from `duo_state` instead.
         const size = duo.primaryPanelSize();
@@ -606,7 +615,7 @@ export class Session extends EventEmitter {
         });
       },
       onFatal: (message) => {
-        if (this.phase === 'ending' || this.phase === 'ended' || this.phase === 'error') return;
+        if (this.isOver() || this.phase === 'error') return;
         err(`duo session ${this.sessionId.slice(0, 8)}: ${message}`);
         this.setPhase('error', { message });
       },
@@ -616,7 +625,7 @@ export class Session extends EventEmitter {
       await rig.start();
     } catch (e) {
       if (this.duo === rig) this.duo = null;
-      if (this.phase === 'ending' || this.phase === 'ended') return;
+      if (this.isOver()) return;
       this.setPhase('error', { message: (e as Error).message });
     }
   }

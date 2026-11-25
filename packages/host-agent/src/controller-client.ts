@@ -41,6 +41,8 @@ export class ControllerClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private getActiveSessions: () => string[];
   private closed = false;
+  /** Asking the controller what it knows, before opening a socket. */
+  private connecting = false;
 
   constructor(
     opts: ControllerClientOptions,
@@ -81,47 +83,65 @@ export class ControllerClient {
     const base: DeviceModel[] = ['iPhone-16-Pro', 'iPad-Pro'];
     const extra = this.opts.deviceModels.filter((m) => !base.includes(m));
     if (extra.length === 0) return this.opts.deviceModels;
-    try {
-      const url = new URL(this.opts.url);
-      url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-      url.pathname = '/health';
-      url.search = '';
-      const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
-      const body = (await res.json()) as { deviceModels?: unknown };
-      const known = Array.isArray(body.deviceModels) ? body.deviceModels : [];
-      const offered = this.opts.deviceModels.filter((m) => base.includes(m) || known.includes(m));
-      const withheld = extra.filter((m) => !offered.includes(m));
-      if (withheld.length > 0) {
-        warn(`Controller does not know ${withheld.join(', ')} (it is older than this agent); not offering it.`);
+    const url = new URL(this.opts.url);
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+    url.pathname = '/health';
+    url.search = '';
+    let failure = '';
+    // One slow answer should not cost the Duo until the next reconnect.
+    for (let attempt = 0; attempt < 3 && !this.closed; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 700));
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        const body = (await res.json()) as { deviceModels?: unknown };
+        const known = Array.isArray(body.deviceModels) ? body.deviceModels : [];
+        const offered = this.opts.deviceModels.filter((m) => base.includes(m) || known.includes(m));
+        const withheld = extra.filter((m) => !offered.includes(m));
+        if (withheld.length > 0) {
+          warn(`Controller does not know ${withheld.join(', ')} (it is older than this agent); not offering it.`);
+        }
+        return offered;
+      } catch (e) {
+        failure = (e as Error).message;
       }
-      return offered;
-    } catch (e) {
-      warn(`Could not ask the controller which devices it knows (${(e as Error).message}); offering iPhone and iPad only.`);
-      return this.opts.deviceModels.filter((m) => base.includes(m));
     }
+    warn(`Could not ask the controller which devices it knows (${failure}); offering iPhone and iPad only.`);
+    return this.opts.deviceModels.filter((m) => base.includes(m));
   }
 
+  /**
+   * Find out what to offer FIRST, then open the socket and greet on it at
+   * once. The greeting has to be the first thing the controller hears on a
+   * new socket (it closes one that says anything else first), and a session
+   * already running on this host may have something to say the moment the
+   * socket is open — so nothing may come between opening and greeting.
+   */
   private connect(): void {
-    if (this.closed) return;
+    if (this.closed || this.connecting) return;
+    this.connecting = true;
+    void this.offeredDeviceModels().then((deviceModels) => {
+      this.connecting = false;
+      if (!this.closed) this.open(deviceModels);
+    });
+  }
+
+  private open(deviceModels: DeviceModel[]): void {
     log(`Connecting to controller @ ${this.opts.url}`);
     const ws = new WebSocket(this.opts.url);
     this.ws = ws;
 
     ws.on('open', () => {
       log('Controller WS open');
-      void this.offeredDeviceModels().then((deviceModels) => {
-        if (ws.readyState !== WebSocket.OPEN) return;
-        this.send({
-          type: 'hello',
-          hostId: this.opts.hostId,
-          hostToken: this.opts.hostToken,
-          capacity: {
-            slots: this.opts.slots,
-            deviceModels,
-            kind: this.opts.kind,
-          },
-          resources: collectResources(),
-        });
+      this.send({
+        type: 'hello',
+        hostId: this.opts.hostId,
+        hostToken: this.opts.hostToken,
+        capacity: {
+          slots: this.opts.slots,
+          deviceModels,
+          kind: this.opts.kind,
+        },
+        resources: collectResources(),
       });
 
       // Heartbeats keep cloudflared's WS idle timeout from killing the conn

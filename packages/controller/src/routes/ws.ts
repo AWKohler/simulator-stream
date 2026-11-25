@@ -366,6 +366,7 @@ function handleSessionConnection(
   }
 
   // Subscribe to orchestrator events for queue position updates & terminal state.
+  let lastResyncAt = 0;
   const unsub = orch.onSessionEvent(sessionId, (rec) => {
     proxy.updateState(
       rec.sessionId,
@@ -420,9 +421,15 @@ function handleSessionConnection(
           orientation: msg.orientation,
         });
         break;
-      case 'resync_video':
-        proxy.replayVideo(sessionId, ws);
+      case 'resync_video': {
+        // Each replay can be megabytes: no more than one a second per browser.
+        const now = Date.now();
+        if (now - lastResyncAt >= 1000) {
+          lastResyncAt = now;
+          proxy.replayVideo(sessionId, ws);
+        }
         break;
+      }
       case 'ping':
         try {
           ws.send(JSON.stringify({ type: 'pong' }));

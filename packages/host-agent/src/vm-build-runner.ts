@@ -771,17 +771,18 @@ function guestBuildScript(
   guestWorkdir: string,
   kind: VmBuildKind,
   meta?: VmArchiveMetadata,
+  /** The simulator preview is for an iPhone Duo. */
+  duo = false,
 ): string {
   const schemeArg = scheme ? `SCHEME=${q(scheme)}` : 'SCHEME=""';
   // Orientation overrides must match the local backend or the preview's rotate
   // control regresses for apps that don't declare orientations themselves.
-  // (One difference is left for when a VM-building host first has the iPhone
-  // Duo: for a Duo session the local backend adds upside-down to the iPhone
-  // list and omits UIRequiresFullScreen, so the Duo's inner screen turns both
-  // ways round. Here neither is done yet, so a Duo would follow the user one
-  // way round only.)
-  const orientationFlags = `INFOPLIST_KEY_UIRequiresFullScreen=YES \
-  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight' \
+  // The iPhone Duo's preview build differs in two ways, as on the local
+  // backend (see build.ts): upside-down joins the iPhone list and
+  // UIRequiresFullScreen is left out, so its inner screen turns both ways round.
+  const iPhoneOrientations = `UIInterfaceOrientationPortrait${duo ? ' UIInterfaceOrientationPortraitUpsideDown' : ''} UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight`;
+  const orientationFlags = `${duo ? '' : 'INFOPLIST_KEY_UIRequiresFullScreen=YES '}\
+  'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=${iPhoneOrientations}' \
   'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'`;
   // NOTE: every flavor builds UNSIGNED. The device .ipa is unsigned by design
   // (the Companion re-signs it with the user's own Apple ID), and the App Store
@@ -912,6 +913,8 @@ export interface VmCompileOptions {
   kind: VmBuildKind;
   /** App Store only: publish-wizard identity/version overrides for the archive. */
   archiveMeta?: VmArchiveMetadata;
+  /** Simulator preview only: the session's device is an iPhone Duo. */
+  duo?: boolean;
 }
 
 export interface VmCompileResult {
@@ -1026,7 +1029,7 @@ export function runVmCompile(options: VmCompileOptions): VmCompileHandle {
       }
 
       // 2. Build inside the guest, streaming sanitized output as it goes.
-      const script = guestBuildScript(project.scheme, workdir, kind, archiveMeta);
+      const script = guestBuildScript(project.scheme, workdir, kind, archiveMeta, options.duo === true);
       const scriptPath = path.join(stage, 'build.sh');
       writeFileSync(scriptPath, script);
       if (kind === 'archive') {
@@ -1326,6 +1329,7 @@ export function runVmBuild(options: BuildOptions): BuildHandle {
     hints: options.hints,
     onLog: options.onLog,
     kind: 'sim',
+    duo: options.deviceModel === 'iPhone-Duo',
   });
   const done = inner.done.then(
     (r): BuildResult => ({
