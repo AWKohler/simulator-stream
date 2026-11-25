@@ -64,6 +64,15 @@ const START_ANGLE = Math.min(180, Math.max(0, envInt('SIM_DUO_START_ANGLE', 180)
 const TOUCH_IDLE_MS = 8_000;
 /** `duo_state` is sent at most this often while the hinge moves. */
 const STATE_INTERVAL_MS = 33;
+/**
+ * A session's first moments are iOS's busiest: the app is still launching and
+ * the system has only just moved to the inner screen. Folding or turning the
+ * device right then has been seen to take down the simulated wallpaper process
+ * and leave the app in the background. So the device is left alone until the
+ * opening fold has come to rest, and a client's first posture (it may have one
+ * ready the instant the stream starts) waits this long after that.
+ */
+const POSTURE_GRACE_MS = 900;
 
 export interface DuoRigEvents {
   onVideoConfig: (display: DuoDisplay, config: FramebufferVideoConfig) => void;
@@ -109,6 +118,12 @@ export class DuoRig {
   private touchIdleTimer: NodeJS.Timeout | null = null;
   /** Taps and swipes are replayed one after another, never interleaved. */
   private gestureQueue: Promise<void> = Promise.resolve();
+  /** Posture inputs are held until this time (see POSTURE_GRACE_MS). */
+  private postureAt = Number.POSITIVE_INFINITY;
+  private heldPosture: { hinge?: { angle: number; instant: boolean }; orientation?: DeviceOrientation } = {};
+  private postureTimer: NodeJS.Timeout | null = null;
+  /** Resolves the wait for the opening fold to come to rest. */
+  private hingeRest: (() => void) | null = null;
 
   private constructor(
     private readonly udid: string,
@@ -127,6 +142,7 @@ export class DuoRig {
       rig.control = await DuoControl.open(udid);
       rig.control.onHinge = (report) => {
         rig.hinge = { angle: report.angle, moving: report.moving };
+        if (!report.moving) rig.hingeRest?.();
         rig.scheduleState();
       };
       rig.control.onExit = (reason) => {
@@ -137,7 +153,18 @@ export class DuoRig {
       // A reused simulator may have been left turned by its last session.
       await rig.control.orientation('portrait');
       await rig.control.setHinge(0, true);
-      if (START_ANGLE > 0) await rig.control.setHinge(START_ANGLE);
+      if (START_ANGLE > 0) {
+        // Wait for the fold to arrive (and iOS to light the inner screen)
+        // before streaming, so the first picture a client sees is the right one.
+        const rested = new Promise<void>((resolve) => {
+          rig.hingeRest = resolve;
+        });
+        await rig.control.setHinge(START_ANGLE);
+        await Promise.race([rested, sleep(2500)]);
+        rig.hingeRest = null;
+        await sleep(350);
+      }
+      if (rig.stopped) throw new Error('Session ended while the iPhone Duo was starting.');
       rig.startCapture();
     } catch (e) {
       rig.stop();
@@ -222,6 +249,7 @@ export class DuoRig {
             this.events.onVideoConfig(display, config);
             if (!this.ready && DUO_DISPLAYS.every((d) => this.panels[d].configured)) {
               this.ready = true;
+              this.postureAt = Date.now() + POSTURE_GRACE_MS;
               clearTimeout(watchdog);
               this.emitState();
               this.events.onReady();
@@ -308,14 +336,12 @@ export class DuoRig {
     try {
       switch (input.kind) {
         case 'hinge':
+          if (this.holdPosture({ hinge: { angle: input.angle, instant: input.instant === true } })) break;
           await control.setHinge(input.angle, input.instant === true);
           break;
         case 'device_orientation':
-          if (input.orientation !== this.orientation) {
-            await control.orientation(input.orientation);
-            this.orientation = input.orientation;
-            this.scheduleState();
-          }
+          if (this.holdPosture({ orientation: input.orientation })) break;
+          await this.applyOrientation(input.orientation);
           break;
         case 'touch':
           // Not awaited: the helper's pipe keeps a touch stream in order.
@@ -359,6 +385,42 @@ export class DuoRig {
     } catch (e) {
       if (!this.stopped) warn(`duo input ${input.kind} failed: ${(e as Error).message}`);
     }
+  }
+
+  private async applyOrientation(orientation: DeviceOrientation): Promise<void> {
+    if (!this.control || orientation === this.orientation) return;
+    await this.control.orientation(orientation);
+    this.orientation = orientation;
+    log(`Duo ${this.udid.slice(0, 8)} held ${orientation}`);
+    this.scheduleState();
+  }
+
+  /**
+   * During the grace period after start-up, keep a posture input (the latest
+   * of each kind) for later instead of applying it. Returns whether it was kept.
+   */
+  private holdPosture(posture: { hinge?: { angle: number; instant: boolean }; orientation?: DeviceOrientation }): boolean {
+    const wait = this.postureAt - Date.now();
+    if (wait <= 0 && !this.postureTimer) return false;
+    Object.assign(this.heldPosture, posture);
+    if (!this.postureTimer) {
+      this.postureTimer = setTimeout(() => {
+        this.postureTimer = null;
+        const held = this.heldPosture;
+        this.heldPosture = {};
+        const control = this.control;
+        if (!control || this.stopped) return;
+        void (async () => {
+          try {
+            if (held.hinge) await control.setHinge(held.hinge.angle, held.hinge.instant);
+            if (held.orientation) await this.applyOrientation(held.orientation);
+          } catch (e) {
+            if (!this.stopped) warn(`duo posture after start failed: ${(e as Error).message}`);
+          }
+        })();
+      }, Math.max(0, wait));
+    }
+    return true;
   }
 
   private gesture(run: () => Promise<void>): Promise<void> {
@@ -451,6 +513,8 @@ export class DuoRig {
     this.stopped = true;
     if (this.stateTimer) clearTimeout(this.stateTimer);
     if (this.touchIdleTimer) clearTimeout(this.touchIdleTimer);
+    if (this.postureTimer) clearTimeout(this.postureTimer);
+    this.hingeRest?.();
     for (const display of DUO_DISPLAYS) {
       const panel = this.panels[display];
       if (!panel) continue;
