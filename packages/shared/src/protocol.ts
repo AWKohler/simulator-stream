@@ -137,6 +137,8 @@ export const DuoState = z.object({
   hingeAngle: z.number(),
   // The hinge is still easing toward the angle last asked for.
   hingeMoving: z.boolean(),
+  // How the device was last said to be held (see DeviceOrientationInput).
+  orientation: z.enum(['portrait', 'portrait-upside-down', 'landscape-left', 'landscape-right']).optional(),
   cover: DuoPanel,
   inner: DuoPanel,
 });
@@ -210,7 +212,14 @@ export type InputFeature = (typeof INPUT_FEATURES)[number];
 //   multi-touch  — `finger` (0 or 1) on `touch` inputs: a second finger, for
 //                  pinch and rotate.
 //   volume-buttons — `button` inputs volumeUp and volumeDown.
-export const DUO_INPUT_FEATURES = ['duo-displays', 'duo-hinge', 'multi-touch', 'volume-buttons'] as const;
+//   device-orientation — `device_orientation` inputs.
+export const DUO_INPUT_FEATURES = [
+  'duo-displays',
+  'duo-hinge',
+  'multi-touch',
+  'volume-buttons',
+  'device-orientation',
+] as const;
 export type DuoInputFeature = (typeof DUO_INPUT_FEATURES)[number];
 
 /** The longest a single replayed gesture may last. */
@@ -282,6 +291,26 @@ export const KeyInput = z.object({
   kind: z.literal('key'),
   key: z.string().max(32),
 });
+// iPhone Duo: how the device is being held, as its motion sensors would report
+// it. iOS turns the interface to match (where the app allows it), exactly as on
+// a device in the hand; the framebuffers do not change shape. Named for the
+// edge that is up, looking at the open inner screen with the hinge upright:
+//   portrait             — the top edge
+//   portrait-upside-down — the bottom edge
+//   landscape-left       — the right-hand half's outer edge (the camera half)
+//   landscape-right      — the left-hand half's outer edge (the cover half)
+// The cover screen keeps its upright layout whichever way the device is held.
+export const DeviceOrientation = z.enum([
+  'portrait',
+  'portrait-upside-down',
+  'landscape-left',
+  'landscape-right',
+]);
+export type DeviceOrientation = z.infer<typeof DeviceOrientation>;
+export const DeviceOrientationInput = z.object({
+  kind: z.literal('device_orientation'),
+  orientation: DeviceOrientation,
+});
 export const Input = z.discriminatedUnion('kind', [
   TapInput,
   SwipeInput,
@@ -291,6 +320,7 @@ export const Input = z.discriminatedUnion('kind', [
   TextInput,
   KeyInput,
   HingeInput,
+  DeviceOrientationInput,
 ]);
 export type Input = z.infer<typeof Input>;
 

@@ -19,6 +19,7 @@
 import {
   DUO_DISPLAYS,
   MAX_GESTURE_MS,
+  type DeviceOrientation,
   type DuoDisplay,
   type DuoState,
   type Input,
@@ -100,6 +101,7 @@ export class DuoRig {
   private control: DuoControl | null = null;
   private panels = {} as Record<DuoDisplay, Panel>;
   private hinge = { angle: 0, moving: false };
+  private orientation: DeviceOrientation = 'portrait';
   private stopped = false;
   private ready = false;
   private stateTimer: NodeJS.Timeout | null = null;
@@ -132,6 +134,8 @@ export class DuoRig {
       };
       // The simulator boots shut. Say so first (the helper cannot read the
       // hinge), then ease to the starting angle so iOS sees a fold it can follow.
+      // A reused simulator may have been left turned by its last session.
+      await rig.control.orientation('portrait');
       await rig.control.setHinge(0, true);
       if (START_ANGLE > 0) await rig.control.setHinge(START_ANGLE);
       rig.startCapture();
@@ -267,6 +271,7 @@ export class DuoRig {
     return {
       hingeAngle: this.hinge.angle,
       hingeMoving: this.hinge.moving,
+      orientation: this.orientation,
       cover: panel('cover'),
       inner: panel('inner'),
     };
@@ -304,6 +309,13 @@ export class DuoRig {
       switch (input.kind) {
         case 'hinge':
           await control.setHinge(input.angle, input.instant === true);
+          break;
+        case 'device_orientation':
+          if (input.orientation !== this.orientation) {
+            await control.orientation(input.orientation);
+            this.orientation = input.orientation;
+            this.scheduleState();
+          }
           break;
         case 'touch':
           // Not awaited: the helper's pipe keeps a touch stream in order.

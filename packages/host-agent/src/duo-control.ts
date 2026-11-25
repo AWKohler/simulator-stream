@@ -182,6 +182,11 @@ export class DuoControl {
     return this.send({ type: 'button', button, down });
   }
 
+  /** How the device is held; iOS turns its interface to match. */
+  orientation(orientation: 'portrait' | 'portrait-upside-down' | 'landscape-left' | 'landscape-right'): Promise<void> {
+    return this.send({ type: 'orientation', orientation });
+  }
+
   /** Keyboard usages as [usage, down] pairs, sent in order. */
   keys(keys: Array<[number, boolean]>): Promise<void> {
     if (keys.length === 0) return Promise.resolve();

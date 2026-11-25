@@ -847,8 +847,8 @@ export class Session extends EventEmitter {
       await this.duo?.handleInput(input);
       return;
     }
-    // The hinge is the Duo's alone.
-    if (input.kind === 'hinge') return;
+    // The hinge and the held orientation are the Duo's alone.
+    if (input.kind === 'hinge' || input.kind === 'device_orientation') return;
     if (!this.windowInfo || !this.screenRect) return;
     const wi = this.windowInfo;
     const sr = this.screenRect;

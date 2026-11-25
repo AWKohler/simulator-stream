@@ -12,6 +12,7 @@
 //   {"id":"4","type":"release","display":"<UUID>"}     lift every finger on a panel
 //   {"id":"5","type":"button","button":"lock","down":true}
 //   {"id":"6","type":"keys","keys":[[4,true],[4,false]]} keyboard usages, down then up
+//   {"id":"8","type":"orientation","orientation":"landscape-left"}  how the device is held
 //   {"id":"7","type":"displays"}                        list the panels that take touches
 //
 // and answers each with {"id":…,"ok":true} or {"id":…,"ok":false,"error":"…"}.
@@ -111,12 +112,15 @@ static dispatch_source_t gHingeTimer;
 static const double kHingeDegreesPerSecond = 420;   // shut → flat in under half a second
 static const double kHingeTickSeconds = 1.0 / 60.0;
 
-static BOOL SendHingeAngle(double angle) {
+// A simulated-sensor control, as Device Hub's own controls send it: a
+// vendor-defined event whose payload is a serialized dictionary naming the
+// control (`source`) and its new value.
+static BOOL SendSensorControl(NSString *source, NSString *type, id value) {
   NSDictionary *payload = @{
     @"provider": @"com.apple.Virtualization.VirtualMachines",
-    @"source": @"hinge-slider-control",
-    @"type": @"range",
-    @"value": @(angle),
+    @"source": source,
+    @"type": type,
+    @"value": value,
   };
   CFDataRef data = SerializeFn((__bridge CFTypeRef)payload, 1 /* binary */);
   if (!data) return NO;
@@ -129,6 +133,25 @@ static BOOL SendHingeAngle(double angle) {
   }
   CFRelease(data);
   return ok;
+}
+
+static BOOL SendHingeAngle(double angle) {
+  return SendSensorControl(@"hinge-slider-control", @"range", @(angle));
+}
+
+// How the device is held. iOS turns its interface to match, as it does when a
+// real device is turned. The values are Device Hub's own.
+static NSString *SetOrientation(NSDictionary *command) {
+  NSString *name = [command[@"orientation"] isKindOfClass:NSString.class] ? command[@"orientation"] : nil;
+  NSDictionary<NSString *, NSString *> *values = @{
+    @"portrait": @"portrait",
+    @"portrait-upside-down": @"pud",
+    @"landscape-left": @"landscape-left",
+    @"landscape-right": @"landscape-right",
+  };
+  NSString *value = name ? values[name] : nil;
+  if (!value) return @"Expected orientation: portrait, portrait-upside-down, landscape-left or landscape-right";
+  return SendSensorControl(@"orientation-picker-control", @"enum", value) ? nil : @"Orientation dispatch failed";
 }
 
 static void ReportHinge(void) {
@@ -400,6 +423,9 @@ static void HandleCommand(NSDictionary *command) {
     ReplyOK(commandID);
   } else if ([type isEqual:@"button"]) {
     NSString *error = Button(command);
+    if (error) ReplyError(commandID, error); else ReplyOK(commandID);
+  } else if ([type isEqual:@"orientation"]) {
+    NSString *error = SetOrientation(command);
     if (error) ReplyError(commandID, error); else ReplyOK(commandID);
   } else if ([type isEqual:@"keys"]) {
     NSString *error = Keys(command);

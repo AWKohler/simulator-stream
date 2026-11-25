@@ -26,3 +26,5 @@ yarn.lock
 # Cloudflare tunnel credentials (per-machine)
 infra/*.json
 infra/*-creds.yml
+packages/host-agent/native/duo-control/build/
+*.srchash
