@@ -219,6 +219,14 @@ export class Session extends EventEmitter {
     return this.phase === 'ready';
   }
 
+  /**
+   * The app has been installed and capture begun: from here on a build is a
+   * rebuild of a running session (new app, same simulator, same streams).
+   * A fact of its own rather than read off the phase — a rebuild that fails
+   * leaves the phase at "building", and the build after it is still a rebuild.
+   */
+  private launched = false;
+
   /** Set once by stop(), never cleared: the one fact about a session that
    * work still in flight (a build, a boot, an install) cannot overwrite. */
   private stopping = false;
@@ -315,6 +323,8 @@ export class Session extends EventEmitter {
   }
 
   private async bootAndCapture(): Promise<void> {
+    // This path owns the capture: a build that arrives later swaps the app only.
+    this.launched = true;
     this.setPhase('booting');
     if (this.isDuo) {
       if (!(await this.bootInParallel())) {
@@ -425,7 +435,7 @@ export class Session extends EventEmitter {
     //    timeout"). So we build FIRST with no sim running (fast), then boot the
     //    iPad ALONE afterwards so it gets its surface cleanly. See the post-build
     //    boot below.
-    const isFirstBuild = this.phase === 'idle' || this.phase === 'building';
+    const isFirstBuild = !this.launched;
     const deferBoot = isFirstBuild && this.deviceModel === 'iPad-Pro';
     const bootTask =
       isFirstBuild && !deferBoot ? this.bootInParallel() : Promise.resolve(true);
@@ -473,7 +483,7 @@ export class Session extends EventEmitter {
       const diagnostics =
         (e as Error & { diagnostics?: BuildDiagnostic[] }).diagnostics ?? [];
       this.emit('build', { event: 'failed', message: msg, diagnostics });
-      if (isFirstBuild) this.setPhase('error', { message: msg });
+      if (!this.launched) this.setPhase('error', { message: msg });
       return;
     }
     this.currentBuild = null;
@@ -511,22 +521,28 @@ export class Session extends EventEmitter {
       if (this.isOver()) return;
       const msg = (e as Error).message;
       this.emit('build', { event: 'failed', message: msg });
-      if (isFirstBuild) this.setPhase('error', { message: msg });
+      if (!this.launched) this.setPhase('error', { message: msg });
       return;
     }
     if (this.isOver()) return;
 
-    if (!isFirstBuild) {
+    // (Asked now, not when the build began: two builds can both have started
+    // as the first, and only one of them may go on to start capture.)
+    if (this.launched) {
       // Re-build on an already-streaming session: simulator + capturer keep
       // running, the app was hot-swapped. Bounce back to 'ready' so the browser
-      // knows the rebuild is done.
-      this.setPhase('ready', {
-        windowInfo: this.windowInfo!,
-        screenRect: this.screenRect!,
-        deviceLogical: this.deviceLogical,
-      });
+      // knows the rebuild is done. (If capture is still coming up, its own
+      // 'ready' says so.)
+      if (this.windowInfo && this.screenRect) {
+        this.setPhase('ready', {
+          windowInfo: this.windowInfo,
+          screenRect: this.screenRect,
+          deviceLogical: this.deviceLogical,
+        });
+      }
       return;
     }
+    this.launched = true;
 
     // The heavy iPad display surface can lag behind app launch on a constrained
     // host. Wait until a screenshot actually succeeds before starting capture,
@@ -546,6 +562,9 @@ export class Session extends EventEmitter {
     // rotate leaves the device in its boot orientation, which we report so the
     // bezel matches. With the portrait default this is a fast no-op (no rotate).
     await this.applyDesiredOrientation();
+    // Stopped during the waits above: start nothing on a simulator that is
+    // going back to the pool.
+    if (this.isOver()) return;
 
     // Capture path. Both iPhone and iPad use the native framebuffer (H.264)
     // capturer. iPad works too as long as the device is fully booted + rendered
@@ -604,6 +623,13 @@ export class Session extends EventEmitter {
     // The session may have been stopped during the boot or install that led
     // here: then there is nothing to start, and the phase is not to be touched.
     if (this.isOver()) return;
+    // Never two rigs on one simulator: their streams would be indistinguishable.
+    if (this.duo) {
+      const previous = this.duo;
+      this.duo = null;
+      previous.stop();
+      if (this.isOver()) return;
+    }
     this.setPhase('capturing');
     // Held from before it starts, so that stopping the session during the
     // seconds a Duo takes to come up stops this too (see `stop`).

@@ -33,7 +33,7 @@ export interface ControllerHandlers {
 
 export type ControllerToHostCmd = ReturnType<typeof ControllerToHost.parse>;
 
-/** How many rounds of an unanswered /health before connecting anyway. */
+/** The round of an unanswered /health on which the agent connects anyway. */
 const MAX_UNANSWERED_ROUNDS = 3;
 
 export class ControllerClient {
@@ -117,11 +117,12 @@ export class ControllerClient {
     // either, so try again shortly rather than register without the Duo and
     // stay that way; if it keeps on not answering, connect with what every
     // controller knows.
+    this.unanswered++;
     if (this.unanswered < MAX_UNANSWERED_ROUNDS) {
-      this.unanswered++;
       warn(`Could not ask the controller which devices it knows (${failure}); trying again.`);
       return null;
     }
+    this.unanswered = 0;
     warn(`Could not ask the controller which devices it knows (${failure}); offering iPhone and iPad only.`);
     return this.opts.deviceModels.filter((m) => base.includes(m));
   }
