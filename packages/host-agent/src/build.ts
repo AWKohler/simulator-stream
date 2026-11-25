@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { BuildDiagnostic, LogStream } from '@sim/shared';
+import type { BuildDiagnostic, DeviceModel, LogStream } from '@sim/shared';
 import { execAsync, execAsSimUser, simUserEnabled } from './util.js';
 import { ensureOrientationShim } from './orientation-shim.js';
 import { log, warn } from './log.js';
@@ -46,6 +46,8 @@ export interface BuildOptions {
   tarballBuf: Buffer;
   hints?: Partial<ProjectInfo>;
   onLog: (line: string, stream: LogStream) => void;
+  /** The device the session previews on. The iPhone Duo's build differs slightly (see runBuild). */
+  deviceModel?: DeviceModel;
 }
 
 export interface DeviceBuildOptions {
@@ -217,6 +219,7 @@ export interface DeviceBuildHandle {
 export function runBuild(options: BuildOptions): BuildHandle {
   assertLocalBackendAllowed('simulator preview');
   const { sessionId, tarballBuf, hints, onLog } = options;
+  const isDuo = options.deviceModel === 'iPhone-Duo';
   const workdir = path.join(BUILDS_ROOT, sessionId);
   let proc: ChildProcess | null = null;
   let cancelled = false;
@@ -283,7 +286,10 @@ export function runBuild(options: BuildOptions): BuildHandle {
         // Upside-down is on the iPhone list for the iPhone Duo: turned one way,
         // its inner screen's interface is upside down in that panel's own terms.
         // (An iPhone with Face ID never turns upside down, whatever is listed.)
-        'INFOPLIST_KEY_UIRequiresFullScreen=YES',
+        // The Duo also goes without UIRequiresFullScreen: with it, iOS refuses
+        // that upside-down turn on the inner screen (seen on iOS 27.1), so the
+        // device would follow the user one way round and not the other.
+        ...(isDuo ? [] : ['INFOPLIST_KEY_UIRequiresFullScreen=YES']),
         'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
         'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
         'build',

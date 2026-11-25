@@ -432,6 +432,7 @@ export class Session extends EventEmitter {
       sessionId: this.sessionId,
       tarballBuf,
       hints,
+      deviceModel: this.deviceModel,
       onLog: (line, stream) => {
         this.emit('build', { event: 'log', line, stream });
         // Live parse: if this log line looks like a compiler diagnostic, also
