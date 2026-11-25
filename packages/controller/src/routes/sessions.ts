@@ -47,6 +47,14 @@ export function sessionRouter(orch: Orchestrator, options: SessionRouterOptions)
       res.status(400).json({ error: 'invalid request', details: parsed.error.format() });
       return;
     }
+    // A device no connected host can run would wait in the queue for ever.
+    if (!orch.supportsDeviceModel(parsed.data.deviceModel)) {
+      res.status(409).json({
+        error: `No simulator host here can run ${parsed.data.deviceModel}.`,
+        code: 'device_unsupported',
+      });
+      return;
+    }
     const session = orch.createSession(
       parsed.data.deviceModel,
       parsed.data.awaitBuild,

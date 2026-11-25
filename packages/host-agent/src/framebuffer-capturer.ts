@@ -1,9 +1,9 @@
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnAsSimUser } from './util.js';
 import { log, warn } from './log.js';
+import { nativeBinaryFresh, stampNativeBinary } from './native-build.js';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE = path.join(PKG_ROOT, 'native', 'framebuffer-capturer', 'main.mm');
@@ -33,6 +33,8 @@ export interface FramebufferCapturerEvents {
   onChunk: (chunk: FramebufferVideoChunk) => void;
   onError: (message: string) => void;
   onExit: (reason: string) => void;
+  /** The panel went on or off (only with `reportLit`). */
+  onLit?: (lit: boolean) => void;
 }
 
 export interface FramebufferCapturerHandle {
@@ -44,6 +46,23 @@ export interface FramebufferCapturerOptions {
   fps: number;
   bitrate: number;
   keyframeInterval: number;
+  /** Which CoreSimulator display to capture, on a device with more than one
+   * built-in panel (the iPhone Duo). Omitted: the largest. */
+  screenID?: number;
+  /** Encode at this fraction of the panel's size (0–1]. */
+  scale?: number;
+  /** Send a frame only when the panel's picture changed (plus two a second). */
+  skipUnchanged?: boolean;
+  /** Report through `onLit` whether iOS has the panel switched on. */
+  reportLit?: boolean;
+}
+
+/** One display of a booted simulator, from the capturer's `--list`. */
+export interface FramebufferDisplay {
+  screenID: number;
+  width: number;
+  height: number;
+  lit: boolean;
 }
 
 interface NativeRecord {
@@ -55,9 +74,7 @@ export async function ensureFramebufferCapturer(): Promise<void> {
   // Pre-provisioned (sim-user mode): the binary is already built + placed at a
   // shared path we can't/​shouldn't recompile into. Trust it.
   if (process.env.SIM_CAPTURER_BIN) return;
-  const sourceMtime = statSync(SOURCE).mtimeMs;
-  const binaryFresh = existsSync(BIN) && statSync(BIN).mtimeMs >= sourceMtime;
-  if (binaryFresh) return;
+  if (nativeBinaryFresh(BIN, [SOURCE])) return;
 
   await new Promise<void>((resolve, reject) => {
     execFile(
@@ -98,6 +115,7 @@ export async function ensureFramebufferCapturer(): Promise<void> {
             reject(new Error(`framebuffer-capturer compile failed: ${stderr || err.message}`));
             return;
           }
+          stampNativeBinary(BIN, [SOURCE]);
           log(`framebuffer-capturer binary ready: ${BIN}`);
           resolve();
         });
@@ -112,6 +130,12 @@ export function startFramebufferCapturer(
 ): FramebufferCapturerHandle {
   // Runs as the sim user — attaches to that user's CoreSimulator framebuffer by
   // UDID (headless; no on-screen window). Frames stream back over stdout.
+  if (
+    options.screenID !== undefined &&
+    (!Number.isInteger(options.screenID) || options.screenID < 0 || options.screenID > 0xffff_ffff)
+  ) {
+    throw new Error('screenID must be an unsigned 32-bit integer');
+  }
   const spawned = spawnAsSimUser(BIN, [
     '--udid',
     options.udid,
@@ -123,6 +147,10 @@ export function startFramebufferCapturer(
     String(options.bitrate),
     '--keyframe-interval',
     String(options.keyframeInterval),
+    ...(options.screenID === undefined ? [] : ['--screen-id', String(options.screenID)]),
+    ...(options.scale !== undefined && options.scale < 1 ? ['--scale', String(options.scale)] : []),
+    ...(options.skipUnchanged ? ['--skip-unchanged'] : []),
+    ...(options.reportLit ? ['--report-lit'] : []),
   ]);
   const proc = spawn(spawned.cmd, spawned.args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -149,6 +177,9 @@ export function startFramebufferCapturer(
         });
         break;
       }
+      case 'lit':
+        events.onLit?.(record.lit === true);
+        break;
       case 'error':
         events.onError(String(record.message ?? 'native framebuffer error'));
         break;
@@ -179,6 +210,39 @@ export function startFramebufferCapturer(
       }, 1000).unref();
     },
   };
+}
+
+/** The displays of a booted simulator that have a framebuffer, largest first. */
+export function listFramebufferDisplays(udid: string): Promise<FramebufferDisplay[]> {
+  return new Promise((resolve, reject) => {
+    const spawned = spawnAsSimUser(BIN, ['--udid', udid, '--list']);
+    const proc = spawn(spawned.cmd, spawned.args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let displays: FramebufferDisplay[] | null = null;
+    let failure: string | null = null;
+    const parser = new RecordParser((record) => {
+      if (record.type === 'displays' && Array.isArray(record.displays)) {
+        displays = (record.displays as Array<Record<string, unknown>>).map((d) => ({
+          screenID: Number(d.screenID),
+          width: Number(d.width),
+          height: Number(d.height),
+          lit: d.lit === true,
+        }));
+      } else if (record.type === 'error') {
+        failure = String(record.message ?? 'native framebuffer error');
+      }
+    });
+    proc.stdout?.on('data', (chunk: Buffer) => parser.push(chunk));
+    const timer = setTimeout(() => proc.kill('SIGKILL'), 10_000);
+    proc.on('close', () => {
+      clearTimeout(timer);
+      if (displays) resolve(displays);
+      else reject(new Error(failure ?? 'could not list the simulator displays'));
+    });
+    proc.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
 }
 
 class RecordParser {

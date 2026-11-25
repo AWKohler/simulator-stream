@@ -8,6 +8,7 @@ import {
   BrowserToServer,
   CAMERA_FRAME_VERSION,
   HostToController,
+  decodeVideoFlags,
   safeParse,
 } from '@sim/shared';
 import type { HostRecord, Orchestrator } from '../orchestrator.js';
@@ -179,8 +180,14 @@ function handleHostConnection(
           fps: msg.fps,
           bitrate: msg.bitrate,
           format: msg.format,
+          ...(msg.display ? { display: msg.display } : {}),
         });
         break;
+      case 'duo_state': {
+        const { type: _type, sessionId, ...state } = msg;
+        proxy.pushDuoState(sessionId, state);
+        break;
+      }
       case 'host_status':
         if (msg.sessionId) proxy.pushStatus(msg.sessionId, msg.message);
         break;
@@ -230,7 +237,8 @@ function handleHostBinary(proxy: SessionProxy, data: Buffer): void {
   const sessionId = data.subarray(12, 12 + sidLen).toString('utf8');
   const payload = data.subarray(12 + sidLen);
   if (payload.length === 0) return;
-  proxy.pushVideoChunk(sessionId, timestampMs, (flags & 1) === 1, payload);
+  const { keyframe, streamIndex } = decodeVideoFlags(flags);
+  proxy.pushVideoChunk(sessionId, timestampMs, keyframe, payload, streamIndex);
 }
 
 function handleBuildEvent(

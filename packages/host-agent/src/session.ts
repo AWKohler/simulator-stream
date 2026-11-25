@@ -1,10 +1,13 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
+import { DUO_INPUT_FEATURES, INPUT_FEATURES } from '@sim/shared';
 import type {
   BuildDiagnostic,
   BuildPhase,
   DeviceLogical,
   DeviceModel,
+  DuoDisplay,
+  DuoState,
   Input,
   LogStream,
   Orientation,
@@ -67,6 +70,7 @@ import {
   type FramebufferVideoChunk,
   type FramebufferVideoConfig,
 } from './framebuffer-capturer.js';
+import { DuoRig } from './duo-rig.js';
 
 export type CaptureMode = 'sck' | 'simctl' | 'idb' | 'framebuffer';
 
@@ -119,8 +123,11 @@ const DEFAULT_DEVICE_LOGICAL: DeviceLogical = { w: 393, h: 852 };
 interface SessionEvents {
   phase: (phase: SessionPhase, payload?: SessionReadyPayload | { message: string }) => void;
   frame: (jpeg: Buffer) => void;
-  videoConfig: (config: FramebufferVideoConfig) => void;
-  videoChunk: (chunk: FramebufferVideoChunk) => void;
+  /** `display` is set for the iPhone Duo, which has a stream per panel. */
+  videoConfig: (config: FramebufferVideoConfig, display?: DuoDisplay) => void;
+  videoChunk: (chunk: FramebufferVideoChunk, display?: DuoDisplay) => void;
+  /** iPhone Duo: the hinge moved or a panel went on or off. */
+  duoState: (state: DuoState) => void;
   log: (message: string) => void;
   build: (payload: BuildEventPayload) => void;
   orientation: (orientation: Orientation) => void;
@@ -190,6 +197,8 @@ export class Session extends EventEmitter {
    * stopping a capturer on purpose never errors the session.
    */
   private captureGen = 0;
+  /** iPhone Duo only: both panels' streams, the hinge and its input path. */
+  private duo: DuoRig | null = null;
 
   constructor(init: SessionInit) {
     super();
@@ -219,11 +228,28 @@ export class Session extends EventEmitter {
     return this.currentOrientation;
   }
 
+  private get isDuo(): boolean {
+    return this.deviceModel === 'iPhone-Duo';
+  }
+
+  /** Optional input this session honours, for the `ready` event. */
+  inputFeatures(): string[] {
+    return this.isDuo ? [...INPUT_FEATURES, ...DUO_INPUT_FEATURES] : [...INPUT_FEATURES];
+  }
+
+  /** The Duo's latest hinge and panel state, once it is streaming. */
+  duoState(): DuoState | null {
+    return this.duo?.isReady() ? this.duo.state() : null;
+  }
+
   /**
    * Rotate the booted sim to `this.desiredOrientation` (best-effort) and report
    * the orientation actually achieved. Called once before capture starts.
    */
   private async applyDesiredOrientation(): Promise<void> {
+    // The Duo is turned by the client, which shows it as an object in space;
+    // its simulator is not rotated.
+    if (this.isDuo) return;
     try {
       const actual = await rotateSimulator(this.udid, this.desiredOrientation);
       this.currentOrientation = actual;
@@ -246,6 +272,7 @@ export class Session extends EventEmitter {
    * to re-emit a fresh video_config at the rotated dimensions.
    */
   async setOrientation(orientation: Orientation): Promise<void> {
+    if (this.isDuo) return;
     this.desiredOrientation = orientation;
     if (this.phase !== 'ready') return; // applied at next capture start
     // Rotate the app's interface to `orientation`. IMPORTANT iOS-26 reality: the
@@ -276,6 +303,14 @@ export class Session extends EventEmitter {
 
   private async bootAndCapture(): Promise<void> {
     this.setPhase('booting');
+    if (this.isDuo) {
+      if (!(await this.bootInParallel())) {
+        this.setPhase('error', { message: 'Simulator boot timed out.' });
+        return;
+      }
+      await this.startDuoCapture();
+      return;
+    }
     const before = await listSimulatorWindows();
     const beforeIds = new Set(before.map((w) => w.id));
 
@@ -500,6 +535,12 @@ export class Session extends EventEmitter {
     // boot-alone + waitForScreenReady above. The IOSurface is the real rendered
     // display, so it's correct on rotation (no simctl screenshot orientation
     // quirk) and high-framerate.
+    if (this.isDuo) {
+      // Two panels, one stream each; input goes through the in-simulator
+      // helper, so no idb companion is started.
+      await this.startDuoCapture();
+      return;
+    }
     if (hasIDB()) startCompanion(this.udid);
     const mode: CaptureMode = ENV_CAPTURE_MODE;
     this.activeCaptureMode = mode;
@@ -534,6 +575,44 @@ export class Session extends EventEmitter {
       await sleep(2000);
     }
     return false;
+  }
+
+  /**
+   * iPhone Duo capture: a stream per panel plus the hinge. `ready` is reported
+   * once both streams have a configuration.
+   */
+  private async startDuoCapture(): Promise<void> {
+    this.setPhase('capturing');
+    try {
+      this.duo = await DuoRig.start(this.udid, {
+        onVideoConfig: (display, config) => this.emit('videoConfig', config, display),
+        onVideoChunk: (display, chunk) => this.emit('videoChunk', chunk, display),
+        onState: (state) => this.emit('duoState', state),
+        onReady: () => {
+          const duo = this.duo;
+          if (!duo || this.phase === 'ending' || this.phase === 'ended') return;
+          // The single-screen fields describe the inner panel; clients that
+          // know the Duo read both panels from `duo_state` instead.
+          const size = duo.primaryPanelSize();
+          this.deviceLogical = { w: Math.round(size.width / size.scale), h: Math.round(size.height / size.scale) };
+          this.windowInfo = { id: 0, x: 0, y: 0, w: size.width, h: size.height, scale: 1 };
+          this.screenRect = { left: 0, top: 0, right: size.width, bottom: size.height };
+          this.setPhase('ready', {
+            windowInfo: this.windowInfo,
+            screenRect: this.screenRect,
+            deviceLogical: this.deviceLogical,
+          });
+        },
+        onFatal: (message) => {
+          if (this.phase === 'ending' || this.phase === 'ended' || this.phase === 'error') return;
+          err(`duo session ${this.sessionId.slice(0, 8)}: ${message}`);
+          this.setPhase('error', { message });
+        },
+      });
+    } catch (e) {
+      if (this.phase === 'ending' || this.phase === 'ended') return;
+      this.setPhase('error', { message: (e as Error).message });
+    }
   }
 
   private async startFramebufferCapture(): Promise<void> {
@@ -726,6 +805,8 @@ export class Session extends EventEmitter {
    * parallel with the xcodebuild step on first-time Swift sessions.
    */
   private async bootInParallel(): Promise<boolean> {
+    // The Duo boots a little slower and keeps its stock services (see bootSimulator).
+    if (this.isDuo) return bootSimulator(this.udid, 180_000, { lean: false });
     return bootSimulator(this.udid);
   }
 
@@ -762,6 +843,12 @@ export class Session extends EventEmitter {
   }
 
   async handleInput(input: Input): Promise<void> {
+    if (this.isDuo) {
+      await this.duo?.handleInput(input);
+      return;
+    }
+    // The hinge is the Duo's alone.
+    if (input.kind === 'hinge') return;
     if (!this.windowInfo || !this.screenRect) return;
     const wi = this.windowInfo;
     const sr = this.screenRect;
@@ -797,7 +884,8 @@ export class Session extends EventEmitter {
         break;
       }
       case 'button':
-        await pressButton(this.udid, input.button);
+        // The volume buttons are only wired up for the Duo.
+        if (input.button === 'home' || input.button === 'lock') await pressButton(this.udid, input.button);
         break;
       case 'scroll':
         this.injectScroll(input.normX, input.normY, input.deltaX, input.deltaY);
@@ -877,6 +965,10 @@ export class Session extends EventEmitter {
     if (this.framebufferCapturer) {
       this.framebufferCapturer.stop();
       this.framebufferCapturer = null;
+    }
+    if (this.duo) {
+      this.duo.stop();
+      this.duo = null;
     }
     stopCompanion(this.udid);
     // erase implies a verified shutdown first, then wipes installed apps +

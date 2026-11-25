@@ -47,6 +47,9 @@ app.get('/health', (_req, res) => {
       slots: h.slots,
       active: h.activeSessionIds.size,
       kind: h.kind,
+      // Device families the agent can run (e.g. only some hosts have the
+      // iPhone Duo). Platforms use it to route a session to a host that can.
+      deviceModels: h.deviceModels,
       lastHeartbeat: h.lastHeartbeat,
     })),
   });

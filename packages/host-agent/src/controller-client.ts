@@ -3,6 +3,7 @@ import { WebSocket } from 'ws';
 import {
   CAMERA_FRAME_VERSION,
   ControllerToHost,
+  type DeviceModel,
   type HostKind,
   type HostToController,
   type ResourceReport,
@@ -18,6 +19,8 @@ export interface ControllerClientOptions {
   /** Isolation posture broadcast to the orchestrator. Defaults to 'bare-metal'
    * so the controller can keep older agents off tenant traffic by default. */
   kind?: HostKind;
+  /** Device families this host can run. Defaults to iPhone and iPad. */
+  deviceModels?: DeviceModel[];
   reconnectMs?: number;
   pingMs?: number;
 }
@@ -48,6 +51,7 @@ export class ControllerClient {
       reconnectMs: 2000,
       pingMs: 30_000,
       kind: 'bare-metal',
+      deviceModels: ['iPhone-16-Pro', 'iPad-Pro'],
       ...opts,
     };
     this.handlers = handlers;
@@ -79,7 +83,7 @@ export class ControllerClient {
         hostToken: this.opts.hostToken,
         capacity: {
           slots: this.opts.slots,
-          deviceModels: ['iPhone-16-Pro', 'iPad-Pro'],
+          deviceModels: this.opts.deviceModels,
           kind: this.opts.kind,
         },
         resources: collectResources(),
