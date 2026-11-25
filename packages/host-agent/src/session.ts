@@ -1,10 +1,13 @@
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
+import { DUO_INPUT_FEATURES, INPUT_FEATURES } from '@sim/shared';
 import type {
   BuildDiagnostic,
   BuildPhase,
   DeviceLogical,
   DeviceModel,
+  DuoDisplay,
+  DuoState,
   Input,
   LogStream,
   Orientation,
@@ -67,6 +70,7 @@ import {
   type FramebufferVideoChunk,
   type FramebufferVideoConfig,
 } from './framebuffer-capturer.js';
+import { DuoRig } from './duo-rig.js';
 
 export type CaptureMode = 'sck' | 'simctl' | 'idb' | 'framebuffer';
 
@@ -119,8 +123,11 @@ const DEFAULT_DEVICE_LOGICAL: DeviceLogical = { w: 393, h: 852 };
 interface SessionEvents {
   phase: (phase: SessionPhase, payload?: SessionReadyPayload | { message: string }) => void;
   frame: (jpeg: Buffer) => void;
-  videoConfig: (config: FramebufferVideoConfig) => void;
-  videoChunk: (chunk: FramebufferVideoChunk) => void;
+  /** `display` is set for the iPhone Duo, which has a stream per panel. */
+  videoConfig: (config: FramebufferVideoConfig, display?: DuoDisplay) => void;
+  videoChunk: (chunk: FramebufferVideoChunk, display?: DuoDisplay) => void;
+  /** iPhone Duo: the hinge moved or a panel went on or off. */
+  duoState: (state: DuoState) => void;
   log: (message: string) => void;
   build: (payload: BuildEventPayload) => void;
   orientation: (orientation: Orientation) => void;
@@ -190,6 +197,8 @@ export class Session extends EventEmitter {
    * stopping a capturer on purpose never errors the session.
    */
   private captureGen = 0;
+  /** iPhone Duo only: both panels' streams, the hinge and its input path. */
+  private duo: DuoRig | null = null;
 
   constructor(init: SessionInit) {
     super();
@@ -210,7 +219,22 @@ export class Session extends EventEmitter {
     return this.phase === 'ready';
   }
 
+  /**
+   * The app has been installed and capture begun: from here on a build is a
+   * rebuild of a running session (new app, same simulator, same streams).
+   * A fact of its own rather than read off the phase — a rebuild that fails
+   * leaves the phase at "building", and the build after it is still a rebuild.
+   */
+  private launched = false;
+
+  /** Set once by stop(), never cleared: the one fact about a session that
+   * work still in flight (a build, a boot, an install) cannot overwrite. */
+  private stopping = false;
+
   private setPhase(p: SessionPhase, payload?: SessionReadyPayload | { message: string }): void {
+    // A stopped session only ends. Whatever a continuation of earlier work
+    // would report ("installing", "ready", "boot timed out") is not true of it.
+    if (this.stopping && p !== 'ending' && p !== 'ended') return;
     this.phase = p;
     this.emit('phase', p, payload);
   }
@@ -219,11 +243,34 @@ export class Session extends EventEmitter {
     return this.currentOrientation;
   }
 
+  /** The session is being, or has been, torn down. (A method, so that a
+   * check made before an await is not assumed to hold after it.) */
+  private isOver(): boolean {
+    return this.stopping || this.phase === 'ending' || this.phase === 'ended';
+  }
+
+  private get isDuo(): boolean {
+    return this.deviceModel === 'iPhone-Duo';
+  }
+
+  /** Optional input this session honours, for the `ready` event. */
+  inputFeatures(): string[] {
+    return this.isDuo ? [...INPUT_FEATURES, ...DUO_INPUT_FEATURES] : [...INPUT_FEATURES];
+  }
+
+  /** The Duo's latest hinge and panel state, once it is streaming. */
+  duoState(): DuoState | null {
+    return this.duo?.isReady() ? this.duo.state() : null;
+  }
+
   /**
    * Rotate the booted sim to `this.desiredOrientation` (best-effort) and report
    * the orientation actually achieved. Called once before capture starts.
    */
   private async applyDesiredOrientation(): Promise<void> {
+    // The Duo is turned by the client, which shows it as an object in space;
+    // its simulator is not rotated.
+    if (this.isDuo) return;
     try {
       const actual = await rotateSimulator(this.udid, this.desiredOrientation);
       this.currentOrientation = actual;
@@ -246,6 +293,7 @@ export class Session extends EventEmitter {
    * to re-emit a fresh video_config at the rotated dimensions.
    */
   async setOrientation(orientation: Orientation): Promise<void> {
+    if (this.isDuo) return;
     this.desiredOrientation = orientation;
     if (this.phase !== 'ready') return; // applied at next capture start
     // Rotate the app's interface to `orientation`. IMPORTANT iOS-26 reality: the
@@ -275,7 +323,17 @@ export class Session extends EventEmitter {
   }
 
   private async bootAndCapture(): Promise<void> {
+    // This path owns the capture: a build that arrives later swaps the app only.
+    this.launched = true;
     this.setPhase('booting');
+    if (this.isDuo) {
+      if (!(await this.bootInParallel())) {
+        this.setPhase('error', { message: 'Simulator boot timed out.' });
+        return;
+      }
+      await this.startDuoCapture();
+      return;
+    }
     const before = await listSimulatorWindows();
     const beforeIds = new Set(before.map((w) => w.id));
 
@@ -377,7 +435,7 @@ export class Session extends EventEmitter {
     //    timeout"). So we build FIRST with no sim running (fast), then boot the
     //    iPad ALONE afterwards so it gets its surface cleanly. See the post-build
     //    boot below.
-    const isFirstBuild = this.phase === 'idle' || this.phase === 'building';
+    const isFirstBuild = !this.launched;
     const deferBoot = isFirstBuild && this.deviceModel === 'iPad-Pro';
     const bootTask =
       isFirstBuild && !deferBoot ? this.bootInParallel() : Promise.resolve(true);
@@ -397,6 +455,7 @@ export class Session extends EventEmitter {
       sessionId: this.sessionId,
       tarballBuf,
       hints,
+      deviceModel: this.deviceModel,
       onLog: (line, stream) => {
         this.emit('build', { event: 'log', line, stream });
         // Live parse: if this log line looks like a compiler diagnostic, also
@@ -424,7 +483,7 @@ export class Session extends EventEmitter {
       const diagnostics =
         (e as Error & { diagnostics?: BuildDiagnostic[] }).diagnostics ?? [];
       this.emit('build', { event: 'failed', message: msg, diagnostics });
-      if (isFirstBuild) this.setPhase('error', { message: msg });
+      if (!this.launched) this.setPhase('error', { message: msg });
       return;
     }
     this.currentBuild = null;
@@ -452,27 +511,38 @@ export class Session extends EventEmitter {
       }
     }
 
+    // Stopped while it built or booted: the simulator is on its way back to
+    // the pool, and nothing more is to be done to it.
+    if (this.isOver()) return;
     this.setPhase('installing');
     try {
       await installAndLaunch(this.udid, result.appBundlePath, result.bundleId, this.camera);
     } catch (e) {
+      if (this.isOver()) return;
       const msg = (e as Error).message;
       this.emit('build', { event: 'failed', message: msg });
-      if (isFirstBuild) this.setPhase('error', { message: msg });
+      if (!this.launched) this.setPhase('error', { message: msg });
       return;
     }
+    if (this.isOver()) return;
 
-    if (!isFirstBuild) {
+    // (Asked now, not when the build began: two builds can both have started
+    // as the first, and only one of them may go on to start capture.)
+    if (this.launched) {
       // Re-build on an already-streaming session: simulator + capturer keep
       // running, the app was hot-swapped. Bounce back to 'ready' so the browser
-      // knows the rebuild is done.
-      this.setPhase('ready', {
-        windowInfo: this.windowInfo!,
-        screenRect: this.screenRect!,
-        deviceLogical: this.deviceLogical,
-      });
+      // knows the rebuild is done. (If capture is still coming up, its own
+      // 'ready' says so.)
+      if (this.windowInfo && this.screenRect) {
+        this.setPhase('ready', {
+          windowInfo: this.windowInfo,
+          screenRect: this.screenRect,
+          deviceLogical: this.deviceLogical,
+        });
+      }
       return;
     }
+    this.launched = true;
 
     // The heavy iPad display surface can lag behind app launch on a constrained
     // host. Wait until a screenshot actually succeeds before starting capture,
@@ -492,6 +562,9 @@ export class Session extends EventEmitter {
     // rotate leaves the device in its boot orientation, which we report so the
     // bezel matches. With the portrait default this is a fast no-op (no rotate).
     await this.applyDesiredOrientation();
+    // Stopped during the waits above: start nothing on a simulator that is
+    // going back to the pool.
+    if (this.isOver()) return;
 
     // Capture path. Both iPhone and iPad use the native framebuffer (H.264)
     // capturer. iPad works too as long as the device is fully booted + rendered
@@ -500,6 +573,12 @@ export class Session extends EventEmitter {
     // boot-alone + waitForScreenReady above. The IOSurface is the real rendered
     // display, so it's correct on rotation (no simctl screenshot orientation
     // quirk) and high-framerate.
+    if (this.isDuo) {
+      // Two panels, one stream each; input goes through the in-simulator
+      // helper, so no idb companion is started.
+      await this.startDuoCapture();
+      return;
+    }
     if (hasIDB()) startCompanion(this.udid);
     const mode: CaptureMode = ENV_CAPTURE_MODE;
     this.activeCaptureMode = mode;
@@ -534,6 +613,61 @@ export class Session extends EventEmitter {
       await sleep(2000);
     }
     return false;
+  }
+
+  /**
+   * iPhone Duo capture: a stream per panel plus the hinge. `ready` is reported
+   * once both streams have a configuration.
+   */
+  private async startDuoCapture(): Promise<void> {
+    // The session may have been stopped during the boot or install that led
+    // here: then there is nothing to start, and the phase is not to be touched.
+    if (this.isOver()) return;
+    // Never two rigs on one simulator: their streams would be indistinguishable.
+    if (this.duo) {
+      const previous = this.duo;
+      this.duo = null;
+      previous.stop();
+      if (this.isOver()) return;
+    }
+    this.setPhase('capturing');
+    // Held from before it starts, so that stopping the session during the
+    // seconds a Duo takes to come up stops this too (see `stop`).
+    const rig = DuoRig.create(this.udid, {
+      onVideoConfig: (display, config) => this.emit('videoConfig', config, display),
+      onVideoChunk: (display, chunk) => this.emit('videoChunk', chunk, display),
+      onState: (state) => this.emit('duoState', state),
+      onReady: () => {
+        const duo = this.duo;
+        if (!duo || this.isOver()) return;
+        // The single-screen fields describe the inner panel; clients that
+        // know the Duo read both panels from `duo_state` instead.
+        const size = duo.primaryPanelSize();
+        this.deviceLogical = { w: Math.round(size.width / size.scale), h: Math.round(size.height / size.scale) };
+        this.windowInfo = { id: 0, x: 0, y: 0, w: size.width, h: size.height, scale: 1 };
+        this.screenRect = { left: 0, top: 0, right: size.width, bottom: size.height };
+        this.setPhase('ready', {
+          windowInfo: this.windowInfo,
+          screenRect: this.screenRect,
+          deviceLogical: this.deviceLogical,
+        });
+      },
+      onFatal: (message) => {
+        if (this.isOver() || this.phase === 'error') return;
+        err(`duo session ${this.sessionId.slice(0, 8)}: ${message}`);
+        this.setPhase('error', { message });
+      },
+    });
+    this.duo = rig;
+    try {
+      await rig.start();
+    } catch (e) {
+      // A rig that was replaced has nothing to say about the session.
+      if (this.duo !== rig) return;
+      this.duo = null;
+      if (this.isOver()) return;
+      this.setPhase('error', { message: (e as Error).message });
+    }
   }
 
   private async startFramebufferCapture(): Promise<void> {
@@ -726,6 +860,8 @@ export class Session extends EventEmitter {
    * parallel with the xcodebuild step on first-time Swift sessions.
    */
   private async bootInParallel(): Promise<boolean> {
+    // The Duo boots a little slower and keeps its stock services (see bootSimulator).
+    if (this.isDuo) return bootSimulator(this.udid, 180_000, { lean: false });
     return bootSimulator(this.udid);
   }
 
@@ -762,6 +898,12 @@ export class Session extends EventEmitter {
   }
 
   async handleInput(input: Input): Promise<void> {
+    if (this.isDuo) {
+      await this.duo?.handleInput(input);
+      return;
+    }
+    // The hinge and the held orientation are the Duo's alone.
+    if (input.kind === 'hinge' || input.kind === 'device_orientation') return;
     if (!this.windowInfo || !this.screenRect) return;
     const wi = this.windowInfo;
     const sr = this.screenRect;
@@ -797,7 +939,8 @@ export class Session extends EventEmitter {
         break;
       }
       case 'button':
-        await pressButton(this.udid, input.button);
+        // The volume buttons are only wired up for the Duo.
+        if (input.button === 'home' || input.button === 'lock') await pressButton(this.udid, input.button);
         break;
       case 'scroll':
         this.injectScroll(input.normX, input.normY, input.deltaX, input.deltaY);
@@ -852,7 +995,8 @@ export class Session extends EventEmitter {
   }
 
   async stop(): Promise<void> {
-    if (this.phase === 'ended' || this.phase === 'ending') return;
+    if (this.stopping || this.phase === 'ended' || this.phase === 'ending') return;
+    this.stopping = true;
     this.setPhase('ending');
     if (this.currentBuild) {
       this.currentBuild.cancel();
@@ -877,6 +1021,10 @@ export class Session extends EventEmitter {
     if (this.framebufferCapturer) {
       this.framebufferCapturer.stop();
       this.framebufferCapturer = null;
+    }
+    if (this.duo) {
+      this.duo.stop();
+      this.duo = null;
     }
     stopCompanion(this.udid);
     // erase implies a verified shutdown first, then wipes installed apps +

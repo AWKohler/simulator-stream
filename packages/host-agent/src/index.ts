@@ -10,9 +10,11 @@ import {
   shutdownAndErasePoolDevices,
   resolveDeviceType,
   deviceTypeMatchesModel,
+  duoSupported,
 } from './simulator.js';
 import type { DeviceModel, Orientation } from '@sim/shared';
-import { INPUT_FEATURES } from '@sim/shared';
+import { DUO_DISPLAY_INDEX, encodeVideoFlags } from '@sim/shared';
+import { ensureDuoControl } from './duo-control.js';
 import { detect, hasIDB, stopAllCompanions } from './idb.js';
 import { ensureCompiled } from './capturer.js';
 import { ensureFramebufferCapturer } from './framebuffer-capturer.js';
@@ -128,6 +130,21 @@ async function main(): Promise<void> {
     }
   }
 
+  // The iPhone Duo is offered only where it can really run: a Mac whose Xcode
+  // has the device and a runtime for it, capturing straight from the
+  // framebuffer (the Duo's two panels have no other capture path), with the
+  // in-simulator control helper built.
+  const deviceModels: DeviceModel[] = ['iPhone-16-Pro', 'iPad-Pro'];
+  if (process.env.SIM_DISABLE_DUO !== '1' && CAPTURE_MODE === 'framebuffer' && duoSupported()) {
+    try {
+      await ensureDuoControl();
+      deviceModels.push('iPhone-Duo');
+      log('iPhone Duo: available on this host.');
+    } catch (e) {
+      warn(`iPhone Duo: control helper could not be built, not offering it: ${(e as Error).message}`);
+    }
+  }
+
   log(`Ensuring simulator pool of ${HOST_SLOTS} iPhone 16 Pro devices...`);
   pool = await ensurePool(HOST_SLOTS);
   log(`Pool ready: ${pool.length} UDIDs.`);
@@ -158,6 +175,7 @@ async function main(): Promise<void> {
       hostToken: HOST_TOKEN,
       slots: HOST_SLOTS,
       kind: HOST_KIND,
+      deviceModels,
     },
     {
       onCommand: handleCommand,
@@ -398,16 +416,29 @@ async function main(): Promise<void> {
       });
     });
 
-    session.on('videoConfig', (config) => {
+    session.on('videoConfig', (config, display) => {
       client.send({
         type: 'video_config',
         sessionId,
         ...config,
+        ...(display ? { display } : {}),
       });
     });
 
-    session.on('videoChunk', (chunk) => {
-      client.sendBinary(encodeHostVideoChunk(sessionId, chunk.timestampMs, chunk.keyframe, chunk.data));
+    session.on('videoChunk', (chunk, display) => {
+      client.sendBinary(
+        encodeHostVideoChunk(
+          sessionId,
+          chunk.timestampMs,
+          chunk.keyframe,
+          chunk.data,
+          display ? DUO_DISPLAY_INDEX[display] : 0,
+        ),
+      );
+    });
+
+    session.on('duoState', (state) => {
+      client.send({ type: 'duo_state', sessionId, ...state });
     });
 
     session.on('orientation', (orientation) => {
@@ -446,9 +477,13 @@ async function main(): Promise<void> {
             screenRect: payload.screenRect,
             deviceLogical: payload.deviceLogical,
             // Tell clients which optional input fields this host honours.
-            features: [...INPUT_FEATURES],
+            features: session.inputFeatures(),
           },
         });
+        // A Duo's panels and hinge, right behind `ready` (and again after a
+        // rebuild) so a client never shows the device without them.
+        const duo = session.duoState();
+        if (duo) client.send({ type: 'duo_state', sessionId, ...duo });
       } else if (phase === 'error') {
         const message = payload && 'message' in payload ? payload.message : 'unknown error';
         client.send({ type: 'session_event', sessionId, event: 'error', payload: { message } });
@@ -549,11 +584,12 @@ function encodeHostVideoChunk(
   timestampMs: number,
   keyframe: boolean,
   payload: Buffer,
+  streamIndex = 0,
 ): Buffer {
   const sid = Buffer.from(sessionId, 'utf8');
   const header = Buffer.alloc(12 + sid.length);
   header.writeUInt8(1, 0); // protocol version
-  header.writeUInt8(keyframe ? 1 : 0, 1);
+  header.writeUInt8(encodeVideoFlags(keyframe, streamIndex), 1);
   header.writeUInt16BE(sid.length, 2);
   header.writeBigUInt64BE(BigInt(Math.max(0, Math.floor(timestampMs))), 4);
   sid.copy(header, 12);

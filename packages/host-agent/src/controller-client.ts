@@ -3,6 +3,7 @@ import { WebSocket } from 'ws';
 import {
   CAMERA_FRAME_VERSION,
   ControllerToHost,
+  type DeviceModel,
   type HostKind,
   type HostToController,
   type ResourceReport,
@@ -18,6 +19,8 @@ export interface ControllerClientOptions {
   /** Isolation posture broadcast to the orchestrator. Defaults to 'bare-metal'
    * so the controller can keep older agents off tenant traffic by default. */
   kind?: HostKind;
+  /** Device families this host can run. Defaults to iPhone and iPad. */
+  deviceModels?: DeviceModel[];
   reconnectMs?: number;
   pingMs?: number;
 }
@@ -30,6 +33,9 @@ export interface ControllerHandlers {
 
 export type ControllerToHostCmd = ReturnType<typeof ControllerToHost.parse>;
 
+/** The round of an unanswered /health on which the agent connects anyway. */
+const MAX_UNANSWERED_ROUNDS = 3;
+
 export class ControllerClient {
   private ws: WebSocket | null = null;
   private opts: Required<ControllerClientOptions>;
@@ -38,6 +44,10 @@ export class ControllerClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private getActiveSessions: () => string[];
   private closed = false;
+  /** Asking the controller what it knows, before opening a socket. */
+  private connecting = false;
+  /** Rounds in a row in which the controller's /health gave no answer. */
+  private unanswered = 0;
 
   constructor(
     opts: ControllerClientOptions,
@@ -48,6 +58,7 @@ export class ControllerClient {
       reconnectMs: 2000,
       pingMs: 30_000,
       kind: 'bare-metal',
+      deviceModels: ['iPhone-16-Pro', 'iPad-Pro'],
       ...opts,
     };
     this.handlers = handlers;
@@ -65,8 +76,76 @@ export class ControllerClient {
     this.ws?.close();
   }
 
+  /**
+   * The device families to offer this controller. A controller validates the
+   * greeting against the families its own protocol knows and ignores one it
+   * cannot parse — which would leave this host serving nothing, iPhone and
+   * iPad included. So anything beyond those two (the iPhone Duo) is offered
+   * only if the controller's /health says it knows it; an older controller,
+   * which says nothing, gets the two it has always had.
+   */
+  private async offeredDeviceModels(): Promise<DeviceModel[] | null> {
+    const base: DeviceModel[] = ['iPhone-16-Pro', 'iPad-Pro'];
+    const extra = this.opts.deviceModels.filter((m) => !base.includes(m));
+    if (extra.length === 0) return this.opts.deviceModels;
+    let failure = '';
+    // One slow answer should not cost the Duo until the next reconnect.
+    for (let attempt = 0; attempt < 3 && !this.closed; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 700));
+      try {
+        const url = new URL(this.opts.url);
+        url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+        url.pathname = '/health';
+        url.search = '';
+        const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+        // (A controller that is starting or failing says nothing about what it knows.)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = (await res.json()) as { deviceModels?: unknown };
+        const known = Array.isArray(body.deviceModels) ? body.deviceModels : [];
+        const offered = this.opts.deviceModels.filter((m) => base.includes(m) || known.includes(m));
+        this.unanswered = 0;
+        const withheld = extra.filter((m) => !offered.includes(m));
+        if (withheld.length > 0) {
+          warn(`Controller does not know ${withheld.join(', ')} (it is older than this agent); not offering it.`);
+        }
+        return offered;
+      } catch (e) {
+        failure = (e as Error).message;
+      }
+    }
+    // No answer. A controller that cannot be asked can rarely be connected to
+    // either, so try again shortly rather than register without the Duo and
+    // stay that way; if it keeps on not answering, connect with what every
+    // controller knows.
+    this.unanswered++;
+    if (this.unanswered < MAX_UNANSWERED_ROUNDS) {
+      warn(`Could not ask the controller which devices it knows (${failure}); trying again.`);
+      return null;
+    }
+    this.unanswered = 0;
+    warn(`Could not ask the controller which devices it knows (${failure}); offering iPhone and iPad only.`);
+    return this.opts.deviceModels.filter((m) => base.includes(m));
+  }
+
+  /**
+   * Find out what to offer FIRST, then open the socket and greet on it at
+   * once. The greeting has to be the first thing the controller hears on a
+   * new socket (it closes one that says anything else first), and a session
+   * already running on this host may have something to say the moment the
+   * socket is open — so nothing may come between opening and greeting.
+   */
   private connect(): void {
-    if (this.closed) return;
+    if (this.closed || this.connecting) return;
+    this.connecting = true;
+    void this.offeredDeviceModels().then((deviceModels) => {
+      this.connecting = false;
+      if (this.closed) return;
+      if (deviceModels) this.open(deviceModels);
+      else this.scheduleReconnect();
+    });
+  }
+
+  private open(deviceModels: DeviceModel[]): void {
     log(`Connecting to controller @ ${this.opts.url}`);
     const ws = new WebSocket(this.opts.url);
     this.ws = ws;
@@ -79,7 +158,7 @@ export class ControllerClient {
         hostToken: this.opts.hostToken,
         capacity: {
           slots: this.opts.slots,
-          deviceModels: ['iPhone-16-Pro', 'iPad-Pro'],
+          deviceModels,
           kind: this.opts.kind,
         },
         resources: collectResources(),

@@ -82,8 +82,67 @@ export const BuildDiagnostic = z.object({
 });
 export type BuildDiagnostic = z.infer<typeof BuildDiagnostic>;
 
-export const DeviceModel = z.enum(['iPhone-16-Pro', 'iPad-Pro']);
+export const DeviceModel = z.enum(['iPhone-16-Pro', 'iPad-Pro', 'iPhone-Duo']);
 export type DeviceModel = z.infer<typeof DeviceModel>;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// iPhone Duo (two panels and a hinge)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// The Duo has two built-in panels: the `cover` on the outside and the `inner`
+// one across the fold. A Duo session streams BOTH at once, as two H.264
+// streams, and takes touches on either. Everything about the second panel is
+// optional on the wire, so a single-panel session reads exactly as before.
+export const DuoDisplay = z.enum(['cover', 'inner']);
+export type DuoDisplay = z.infer<typeof DuoDisplay>;
+
+/** Stream index carried in a video chunk's flags (bits 1–2). 0 is the only
+ * stream of a single-panel device, and the Duo's cover. */
+export const DUO_DISPLAY_INDEX: Record<DuoDisplay, number> = { cover: 0, inner: 1 };
+export const DUO_DISPLAYS: readonly DuoDisplay[] = ['cover', 'inner'];
+
+/** Video chunk flags: bit 0 = keyframe, bits 1–2 = stream index. */
+export const VIDEO_FLAG_KEYFRAME = 1;
+export const VIDEO_FLAG_STREAM_SHIFT = 1;
+export const VIDEO_FLAG_STREAM_MASK = 0b110;
+
+export function encodeVideoFlags(keyframe: boolean, streamIndex = 0): number {
+  return (keyframe ? VIDEO_FLAG_KEYFRAME : 0) | ((streamIndex << VIDEO_FLAG_STREAM_SHIFT) & VIDEO_FLAG_STREAM_MASK);
+}
+
+export function decodeVideoFlags(flags: number): { keyframe: boolean; streamIndex: number } {
+  return {
+    keyframe: (flags & VIDEO_FLAG_KEYFRAME) === VIDEO_FLAG_KEYFRAME,
+    streamIndex: (flags & VIDEO_FLAG_STREAM_MASK) >> VIDEO_FLAG_STREAM_SHIFT,
+  };
+}
+
+/** One panel of the Duo, as the host sees it. */
+export const DuoPanel = z.object({
+  // Framebuffer size in pixels: the frame its video stream and its touch
+  // coordinates use. The inner panel's is taller than wide, with the fold
+  // running across the middle (the device held with the hinge horizontal).
+  width: z.number(),
+  height: z.number(),
+  // Points → pixels.
+  scale: z.number(),
+  // iOS has this panel switched on. An unlit panel streams black.
+  lit: z.boolean(),
+});
+export type DuoPanel = z.infer<typeof DuoPanel>;
+
+/** Where the hinge is and which panels are on. Sent whenever any of it changes. */
+export const DuoState = z.object({
+  // Fold angle the simulator has been given: 0 shut … 180 open flat.
+  hingeAngle: z.number(),
+  // The hinge is still easing toward the angle last asked for.
+  hingeMoving: z.boolean(),
+  // How the device was last said to be held (see DeviceOrientationInput).
+  orientation: z.enum(['portrait', 'portrait-upside-down', 'landscape-left', 'landscape-right']).optional(),
+  cover: DuoPanel,
+  inner: DuoPanel,
+});
+export type DuoState = z.infer<typeof DuoState>;
 
 // Device orientation. The host achieves non-default orientations by rotating
 // the booted simulator (Device ▸ Rotate) and re-probing dimensions, so the
@@ -145,6 +204,24 @@ export type ResourceReport = z.infer<typeof ResourceReport>;
 export const INPUT_FEATURES = ['gesture-duration', 'swipe-end-hold', 'touch-stream', 'hardware-buttons'] as const;
 export type InputFeature = (typeof INPUT_FEATURES)[number];
 
+// Listed in addition, by an iPhone Duo session only:
+//
+//   duo-displays — two video streams (see DUO_DISPLAY_INDEX), `duo_state`
+//                  messages, and `display` on touch, tap, swipe and scroll.
+//   duo-hinge    — `hinge` inputs.
+//   multi-touch  — `finger` (0 or 1) on `touch` inputs: a second finger, for
+//                  pinch and rotate.
+//   volume-buttons — `button` inputs volumeUp and volumeDown.
+//   device-orientation — `device_orientation` inputs.
+export const DUO_INPUT_FEATURES = [
+  'duo-displays',
+  'duo-hinge',
+  'multi-touch',
+  'volume-buttons',
+  'device-orientation',
+] as const;
+export type DuoInputFeature = (typeof DUO_INPUT_FEATURES)[number];
+
 /** The longest a single replayed gesture may last. */
 export const MAX_GESTURE_MS = 3000;
 
@@ -154,6 +231,8 @@ export const TapInput = z.object({
   normY: z.number(),
   // How long the finger stays down. Omitted: a plain tap.
   durationMs: z.number().min(0).max(MAX_GESTURE_MS).optional(),
+  // iPhone Duo: the panel touched. Omitted: whichever panel is lit.
+  display: DuoDisplay.optional(),
 });
 export const SwipeInput = z.object({
   kind: z.literal('swipe'),
@@ -165,6 +244,7 @@ export const SwipeInput = z.object({
   durationMs: z.number().min(0).max(MAX_GESTURE_MS).optional(),
   // How long the finger rests at the end before lifting. Omitted: it lifts at once.
   endHoldMs: z.number().min(0).max(1000).optional(),
+  display: DuoDisplay.optional(),
 });
 // One finger, live. `down` starts a touch, `move` moves it, `up` lifts it.
 // A touch left down (client gone) is lifted by the host after a few seconds.
@@ -173,11 +253,14 @@ export const TouchInput = z.object({
   phase: z.enum(['down', 'move', 'up']),
   normX: z.number(),
   normY: z.number(),
+  display: DuoDisplay.optional(),
+  // Which finger (see `multi-touch`). Omitted: the first.
+  finger: z.number().int().min(0).max(1).optional(),
 });
-// A hardware button press.
+// A hardware button press. The volume buttons need `volume-buttons`.
 export const ButtonInput = z.object({
   kind: z.literal('button'),
-  button: z.enum(['home', 'lock']),
+  button: z.enum(['home', 'lock', 'volumeUp', 'volumeDown']),
 });
 export const ScrollInput = z.object({
   kind: z.literal('scroll'),
@@ -185,6 +268,16 @@ export const ScrollInput = z.object({
   normY: z.number(),
   deltaX: z.number(),
   deltaY: z.number(),
+  display: DuoDisplay.optional(),
+});
+// iPhone Duo: fold the device to `angle` degrees (0 shut … 180 open flat). The
+// host eases the hinge there, so a client sends the angle it wants — while a
+// drag is in progress, as often as it likes — and follows `duo_state` for
+// where the hinge really is. `instant` skips the easing.
+export const HingeInput = z.object({
+  kind: z.literal('hinge'),
+  angle: z.number().finite().min(0).max(180),
+  instant: z.boolean().optional(),
 });
 // Printable characters — typed verbatim via `idb ui text`.
 export const TextInput = z.object({
@@ -198,6 +291,26 @@ export const KeyInput = z.object({
   kind: z.literal('key'),
   key: z.string().max(32),
 });
+// iPhone Duo: how the device is being held, as its motion sensors would report
+// it. iOS turns the interface to match (where the app allows it), exactly as on
+// a device in the hand; the framebuffers do not change shape. Named for the
+// edge that is up, looking at the open inner screen with the hinge upright:
+//   portrait             — the top edge
+//   portrait-upside-down — the bottom edge
+//   landscape-left       — the right-hand half's outer edge (the camera half)
+//   landscape-right      — the left-hand half's outer edge (the cover half)
+// The cover screen keeps its upright layout whichever way the device is held.
+export const DeviceOrientation = z.enum([
+  'portrait',
+  'portrait-upside-down',
+  'landscape-left',
+  'landscape-right',
+]);
+export type DeviceOrientation = z.infer<typeof DeviceOrientation>;
+export const DeviceOrientationInput = z.object({
+  kind: z.literal('device_orientation'),
+  orientation: DeviceOrientation,
+});
 export const Input = z.discriminatedUnion('kind', [
   TapInput,
   SwipeInput,
@@ -206,6 +319,8 @@ export const Input = z.discriminatedUnion('kind', [
   ScrollInput,
   TextInput,
   KeyInput,
+  HingeInput,
+  DeviceOrientationInput,
 ]);
 export type Input = z.infer<typeof Input>;
 
@@ -241,7 +356,10 @@ export const ServerVideoConfigMsg = z.object({
   fps: z.number(),
   bitrate: z.number(),
   format: z.literal('annexb'),
+  // iPhone Duo: which panel this stream is. Omitted on a single-panel device.
+  display: DuoDisplay.optional(),
 });
+export const ServerDuoStateMsg = DuoState.extend({ type: z.literal('duo_state') });
 export const ServerErrorMsg = z.object({
   type: z.literal('error'),
   message: z.string(),
@@ -298,6 +416,7 @@ export const ServerToBrowser = z.discriminatedUnion('type', [
   ServerBuildStatusMsg,
   ServerBuildLogMsg,
   ServerBuildDiagnosticsMsg,
+  ServerDuoStateMsg,
 ]);
 export type ServerToBrowser = z.infer<typeof ServerToBrowser>;
 
@@ -328,6 +447,12 @@ export const ClientCameraStateMsg = z.object({
   height: z.number().optional(),
 });
 
+// iPhone Duo: send each stream's picture so far again (its last keyframe and
+// what followed). For a client whose decoder had to start over — an app back
+// from the background, say — and would otherwise wait for the next keyframe,
+// which on a still panel is seconds away.
+export const ClientResyncVideoMsg = z.object({ type: z.literal('resync_video') });
+
 export const BrowserToServer = z.discriminatedUnion('type', [
   ClientInputMsg,
   ClientCalibrationSetMsg,
@@ -335,6 +460,7 @@ export const BrowserToServer = z.discriminatedUnion('type', [
   ClientPingMsg,
   ClientCameraStateMsg,
   ClientSetOrientationMsg,
+  ClientResyncVideoMsg,
 ]);
 export type BrowserToServer = z.infer<typeof BrowserToServer>;
 
@@ -483,6 +609,11 @@ export const HostVideoConfigMsg = z.object({
   fps: z.number(),
   bitrate: z.number(),
   format: z.literal('annexb'),
+  display: DuoDisplay.optional(),
+});
+export const HostDuoStateMsg = DuoState.extend({
+  type: z.literal('duo_state'),
+  sessionId: z.string(),
 });
 export const HostStatusMsg = z.object({
   type: z.literal('host_status'),
@@ -565,6 +696,7 @@ export const HostToController = z.discriminatedUnion('type', [
   HostBuildEventMsg,
   HostDeviceBuildEventMsg,
   HostAppStoreBuildEventMsg,
+  HostDuoStateMsg,
 ]);
 export type HostToController = z.infer<typeof HostToController>;
 

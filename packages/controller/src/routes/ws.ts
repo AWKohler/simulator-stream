@@ -8,6 +8,7 @@ import {
   BrowserToServer,
   CAMERA_FRAME_VERSION,
   HostToController,
+  decodeVideoFlags,
   safeParse,
 } from '@sim/shared';
 import type { HostRecord, Orchestrator } from '../orchestrator.js';
@@ -179,8 +180,14 @@ function handleHostConnection(
           fps: msg.fps,
           bitrate: msg.bitrate,
           format: msg.format,
+          ...(msg.display ? { display: msg.display } : {}),
         });
         break;
+      case 'duo_state': {
+        const { type: _type, sessionId, ...state } = msg;
+        proxy.pushDuoState(sessionId, state);
+        break;
+      }
       case 'host_status':
         if (msg.sessionId) proxy.pushStatus(msg.sessionId, msg.message);
         break;
@@ -230,7 +237,8 @@ function handleHostBinary(proxy: SessionProxy, data: Buffer): void {
   const sessionId = data.subarray(12, 12 + sidLen).toString('utf8');
   const payload = data.subarray(12 + sidLen);
   if (payload.length === 0) return;
-  proxy.pushVideoChunk(sessionId, timestampMs, (flags & 1) === 1, payload);
+  const { keyframe, streamIndex } = decodeVideoFlags(flags);
+  proxy.pushVideoChunk(sessionId, timestampMs, keyframe, payload, streamIndex);
 }
 
 function handleBuildEvent(
@@ -358,6 +366,8 @@ function handleSessionConnection(
   }
 
   // Subscribe to orchestrator events for queue position updates & terminal state.
+  let lastResyncAt = 0;
+  let resyncTimer: NodeJS.Timeout | null = null;
   const unsub = orch.onSessionEvent(sessionId, (rec) => {
     proxy.updateState(
       rec.sessionId,
@@ -412,6 +422,24 @@ function handleSessionConnection(
           orientation: msg.orientation,
         });
         break;
+      case 'resync_video': {
+        // Each replay can be megabytes: no more than one a second per browser.
+        // One asked for sooner is sent when the second is up, not dropped: the
+        // viewer has thrown its decoders away and a still screen may not send
+        // another keyframe for seconds.
+        const wait = lastResyncAt + 1000 - Date.now();
+        if (wait <= 0) {
+          lastResyncAt = Date.now();
+          proxy.replayVideo(sessionId, ws);
+        } else if (!resyncTimer) {
+          resyncTimer = setTimeout(() => {
+            resyncTimer = null;
+            lastResyncAt = Date.now();
+            proxy.replayVideo(sessionId, ws);
+          }, wait);
+        }
+        break;
+      }
       case 'ping':
         try {
           ws.send(JSON.stringify({ type: 'pong' }));
@@ -424,6 +452,7 @@ function handleSessionConnection(
 
   ws.on('close', () => {
     unsub();
+    if (resyncTimer) clearTimeout(resyncTimer);
     proxy.detachBrowser(sessionId, ws);
   });
 }

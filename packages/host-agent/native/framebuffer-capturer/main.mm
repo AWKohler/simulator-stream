@@ -152,6 +152,13 @@ static uint32_t DescriptorScreenID(id descriptor) {
     if (Responds(descriptor, @selector(screenID))) {
       return ((uint32_t (*)(id, SEL))objc_msgSend)(descriptor, @selector(screenID));
     }
+    // Xcode 27 puts the screen identity on screenProperties, not descriptor.state.
+    if (Responds(descriptor, @selector(screenProperties))) {
+      id properties = SendId(descriptor, @selector(screenProperties));
+      if (Responds(properties, @selector(screenID))) {
+        return ((uint32_t (*)(id, SEL))objc_msgSend)(properties, @selector(screenID));
+      }
+    }
     if (Responds(descriptor, @selector(state))) {
       id state = SendId(descriptor, @selector(state));
       if (Responds(state, @selector(screenID))) {
@@ -179,7 +186,8 @@ static IOSurfaceRef CopySurfaceFromDescriptor(id descriptor) {
   return nil;
 }
 
-static FramebufferSource *FindFramebuffer(NSString *udid, NSString **error) {
+// Every display of the device that has a framebuffer surface, largest first.
+static NSArray<FramebufferSource *> *ListFramebuffers(NSString *udid, NSString **error) {
   id device = FindDevice(udid, error);
   if (!device) return nil;
   id io = Responds(device, @selector(io)) ? SendId(device, @selector(io)) : nil;
@@ -207,7 +215,6 @@ static FramebufferSource *FindFramebuffer(NSString *udid, NSString **error) {
     src.width = IOSurfaceGetWidth(surface);
     src.height = IOSurfaceGetHeight(surface);
     [candidates addObject:src];
-    CFRelease(surface);
   }
 
   if (candidates.count == 0) {
@@ -222,7 +229,20 @@ static FramebufferSource *FindFramebuffer(NSString *udid, NSString **error) {
     if (a.displayClass != b.displayClass) return a.displayClass < b.displayClass ? NSOrderedAscending : NSOrderedDescending;
     return NSOrderedSame;
   }];
-  return candidates.firstObject;
+  return candidates;
+}
+
+// The display to capture: the one with `screenID` when given (a device with
+// more than one built-in panel, such as the iPhone Duo), else the largest.
+static FramebufferSource *FindFramebuffer(NSString *udid, NSNumber *screenID, NSString **error) {
+  NSArray<FramebufferSource *> *candidates = ListFramebuffers(udid, error);
+  if (!candidates) return nil;
+  if (!screenID) return candidates.firstObject;
+  for (FramebufferSource *src in candidates) {
+    if (src.screenID == screenID.unsignedIntValue) return src;
+  }
+  if (error) *error = [NSString stringWithFormat:@"no IOSurface framebuffer for screen %@", screenID];
+  return nil;
 }
 
 static BOOL DumpSurfacePNG(IOSurfaceRef surface, NSString *path, NSString **error) {
@@ -258,7 +278,18 @@ static BOOL DumpSurfacePNG(IOSurfaceRef surface, NSString *path, NSString **erro
 @property (nonatomic, assign) int fps;
 @property (nonatomic, assign) int bitrate;
 @property (nonatomic, assign) int keyInterval;
+// Frames are stamped with the time they were captured instead of a frame
+// count, and keyframes are placed by time as well as by count. For a stream
+// that only sends a frame when the picture changes (--skip-unchanged).
+@property (nonatomic, assign) BOOL wallClock;
+@property (nonatomic, assign) uint64_t startedAt;
+@property (nonatomic, assign) uint64_t lastKeyframeAt;
+@property (nonatomic, assign) int framesSinceKeyframe;
 @end
+
+static uint64_t NowMs(void) {
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000ull;
+}
 
 static void WriteAnnexB(CMSampleBufferRef sampleBuffer) {
   if (!sampleBuffer || !CMSampleBufferDataIsReady(sampleBuffer)) return;
@@ -344,7 +375,9 @@ static void CompressionCallback(void *outputCallbackRefCon, void *sourceFrameRef
   VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
   VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel);
   VTSessionSetProperty(_session, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(bitrate));
-  VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(keyInterval));
+  // With wall-clock stamps the keyframes are forced from encodePixelBuffer:
+  // (a count alone would leave an unchanging panel without one for minutes).
+  VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(self.wallClock ? keyInterval * 30 : keyInterval));
   VTSessionSetProperty(_session, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFTypeRef)@(fps));
   VTCompressionSessionPrepareToEncodeFrames(_session);
   WriteJSONRecord(@{
@@ -361,10 +394,27 @@ static void CompressionCallback(void *outputCallbackRefCon, void *sourceFrameRef
 
 - (void)encodePixelBuffer:(CVPixelBufferRef)pixelBuffer {
   if (!_session || !pixelBuffer) return;
-  CMTime pts = CMTimeMake(self.frameNumber, self.fps);
   VTEncodeInfoFlags flags = 0;
-  VTCompressionSessionEncodeFrame(_session, pixelBuffer, pts, kCMTimeInvalid, NULL, NULL, &flags);
+  if (!self.wallClock) {
+    CMTime pts = CMTimeMake(self.frameNumber, self.fps);
+    VTCompressionSessionEncodeFrame(_session, pixelBuffer, pts, kCMTimeInvalid, NULL, NULL, &flags);
+    self.frameNumber++;
+    return;
+  }
+  uint64_t now = NowMs();
+  if (self.startedAt == 0) self.startedAt = now;
+  // A keyframe every `keyInterval` frames while the picture is moving, and at
+  // least every five seconds while it is still.
+  BOOL key = self.frameNumber == 0 || self.framesSinceKeyframe >= self.keyInterval || now - self.lastKeyframeAt >= 5000;
+  NSDictionary *frameProperties = key ? @{(__bridge NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
+  if (key) {
+    self.lastKeyframeAt = now;
+    self.framesSinceKeyframe = 0;
+  }
+  CMTime pts = CMTimeMake((int64_t)(now - self.startedAt), 1000);
+  VTCompressionSessionEncodeFrame(_session, pixelBuffer, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)frameProperties, NULL, &flags);
   self.frameNumber++;
+  self.framesSinceKeyframe++;
 }
 
 - (void)stop {
@@ -388,6 +438,51 @@ static CVPixelBufferRef CreatePixelBuffer(IOSurfaceRef surface) {
   return pixelBuffer;
 }
 
+// True when the panel shows anything at all. A panel iOS has switched off
+// (the Duo's cover while it is open, its inner screen while it is closed)
+// keeps a framebuffer of pure black, so any non-zero sample means it is lit.
+// Samples a sparse grid plus two dense rows where the status bar sits, since a
+// dark app screen may have nothing else that is not black.
+// BGRA. Outside the panel's rounded corners the masked surface is transparent
+// (and not black), so only opaque pixels count.
+static inline BOOL PixelIsLit(const uint8_t *px) {
+  return px[3] > 200 && (px[0] > 6 || px[1] > 6 || px[2] > 6);
+}
+
+static BOOL SurfaceIsLit(IOSurfaceRef surface) {
+  if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return YES;
+  const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surface);
+  size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface);
+  size_t rowBytes = IOSurfaceGetBytesPerRow(surface);
+  BOOL lit = NO;
+  if (base && width > 0 && height > 0) {
+    const size_t grid = 48;
+    for (size_t gy = 0; gy < grid && !lit; gy++) {
+      const uint8_t *row = base + ((gy * 2 + 1) * height / (grid * 2)) * rowBytes;
+      for (size_t gx = 0; gx < grid; gx++) {
+        const uint8_t *px = row + ((gx * 2 + 1) * width / (grid * 2)) * 4;
+        if (PixelIsLit(px)) { lit = YES; break; }
+      }
+    }
+    // Dense bands near each edge: wherever the status bar ends up.
+    const double bands[] = {0.012, 0.02, 0.03, 0.97, 0.98, 0.988};
+    for (size_t b = 0; b < sizeof(bands) / sizeof(bands[0]) && !lit; b++) {
+      const uint8_t *row = base + (size_t)(bands[b] * (double)(height - 1)) * rowBytes;
+      for (size_t x = 0; x < width; x += 3) {
+        const uint8_t *px = row + x * 4;
+        if (PixelIsLit(px)) { lit = YES; break; }
+      }
+      size_t col = (size_t)(bands[b] * (double)(width - 1));
+      for (size_t y = 0; y < height && !lit; y += 3) {
+        const uint8_t *px = base + y * rowBytes + col * 4;
+        if (PixelIsLit(px)) { lit = YES; break; }
+      }
+    }
+  }
+  IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+  return lit;
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     NSMutableArray<NSString *> *args = [NSMutableArray array];
@@ -401,6 +496,26 @@ int main(int argc, char **argv) {
     int fps = [ArgValue(args, @"--fps", @"60") intValue];
     int bitrate = [ArgValue(args, @"--bitrate", @"6000000") intValue];
     int keyInterval = [ArgValue(args, @"--keyframe-interval", [NSString stringWithFormat:@"%d", fps]) intValue];
+    // Which display to capture, for a device with more than one panel.
+    NSNumber *screenID = nil;
+    NSString *screenArg = ArgValue(args, @"--screen-id", nil);
+    if (screenArg) {
+      NSScanner *scanner = [NSScanner scannerWithString:screenArg];
+      long long parsed = 0;
+      if (![scanner scanLongLong:&parsed] || !scanner.isAtEnd || parsed < 0 || parsed > UINT32_MAX) {
+        WriteError(@"--screen-id must be an unsigned integer");
+        return 2;
+      }
+      screenID = @((uint32_t)parsed);
+    }
+    // Encode at this fraction of the panel's size (0 < scale <= 1).
+    double scale = [ArgValue(args, @"--scale", @"1") doubleValue];
+    if (!(scale > 0.1 && scale <= 1)) scale = 1;
+    // Encode a frame only when the panel changed, plus one every `idle` seconds
+    // so a client that joins late is never without a picture for long.
+    BOOL skipUnchanged = HasArg(args, @"--skip-unchanged");
+    // Report whether the panel is lit (see SurfaceIsLit) whenever that changes.
+    BOOL reportLit = HasArg(args, @"--report-lit");
 
     NSString *loadError = nil;
     if (!LoadPrivateFrameworks(&loadError)) {
@@ -408,8 +523,29 @@ int main(int argc, char **argv) {
       return 2;
     }
 
+    if (HasArg(args, @"--list")) {
+      NSString *listError = nil;
+      NSArray<FramebufferSource *> *all = ListFramebuffers(udid, &listError);
+      if (!all) {
+        WriteError(listError ?: @"framebuffer not found");
+        return 3;
+      }
+      NSMutableArray *displays = [NSMutableArray array];
+      for (FramebufferSource *src in all) {
+        [displays addObject:@{
+          @"screenID": @(src.screenID),
+          @"width": @(src.width),
+          @"height": @(src.height),
+          @"displayClass": @(src.displayClass),
+          @"lit": @(SurfaceIsLit(src.surface)),
+        }];
+      }
+      WriteJSONRecord(@{@"type": @"displays", @"displays": displays});
+      return 0;
+    }
+
     NSString *fbError = nil;
-    FramebufferSource *source = FindFramebuffer(udid, &fbError);
+    FramebufferSource *source = FindFramebuffer(udid, screenID, &fbError);
     if (!source) {
       WriteError(fbError ?: @"framebuffer not found");
       return 3;
@@ -422,6 +558,7 @@ int main(int argc, char **argv) {
         @"height": @(source.height),
         @"displayClass": @(source.displayClass),
         @"screenID": @(source.screenID),
+        @"lit": @(SurfaceIsLit(source.surface)),
       });
       return 0;
     }
@@ -443,18 +580,50 @@ int main(int argc, char **argv) {
       return 5;
     }
 
+    // H.264 wants even dimensions; a scaled size is rounded down to them.
+    int encWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
+    int encHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
+    if (scale < 1) {
+      encWidth = MAX(2, ((int)(encWidth * scale)) & ~1);
+      encHeight = MAX(2, ((int)(encHeight * scale)) & ~1);
+    }
+
     H264Encoder *encoder = [H264Encoder new];
+    encoder.wallClock = skipUnchanged;
     NSString *encError = nil;
-    if (![encoder startWithWidth:(int)CVPixelBufferGetWidth(pixelBuffer) height:(int)CVPixelBufferGetHeight(pixelBuffer) fps:fps bitrate:bitrate keyInterval:keyInterval error:&encError]) {
+    if (![encoder startWithWidth:encWidth height:encHeight fps:fps bitrate:bitrate keyInterval:keyInterval error:&encError]) {
       CVPixelBufferRelease(pixelBuffer);
       WriteError(encError);
       return 6;
     }
 
+    IOSurfaceRef surface = source.surface;
+    __block uint32_t lastSeed = IOSurfaceGetSeed(surface) - 1;
+    __block int ticksSinceEncode = 0;
+    __block int ticksSinceLitCheck = 1 << 20;
+    __block int litState = -1;
+    const int idleTicks = MAX(1, fps / 2);       // an unchanged panel still sends two frames a second
+    const int litTicks = MAX(1, fps / 6);        // lit state checked about six times a second
+
     uint64_t intervalNs = (uint64_t)(1000000000.0 / MAX(1, fps));
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, intervalNs / 5);
     dispatch_source_set_event_handler(timer, ^{
+      if (reportLit && ++ticksSinceLitCheck >= litTicks) {
+        ticksSinceLitCheck = 0;
+        int lit = SurfaceIsLit(surface) ? 1 : 0;
+        if (lit != litState) {
+          litState = lit;
+          WriteJSONRecord(@{@"type": @"lit", @"lit": @(lit == 1)});
+        }
+      }
+      if (skipUnchanged) {
+        uint32_t seed = IOSurfaceGetSeed(surface);
+        ticksSinceEncode++;
+        if (seed == lastSeed && ticksSinceEncode < idleTicks) return;
+        lastSeed = seed;
+        ticksSinceEncode = 0;
+      }
       [encoder encodePixelBuffer:pixelBuffer];
     });
     dispatch_resume(timer);

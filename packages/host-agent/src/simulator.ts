@@ -92,8 +92,29 @@ function runtimeFor(deviceType: string): string | null {
 // Sessions claim from this pool; on release they shut down (kept allocated).
 // ──────────────────────────────────────────────────────────────────────────────
 
-const POOL_PREFIX = 'PoC-Sim-';
+// Pool devices are found by name. A second agent on the same Mac (a staging
+// one beside the live one) needs its own prefix, or each would erase the
+// other's simulators at startup.
+const POOL_PREFIX = /^[A-Za-z0-9._-]{1,32}$/.test(process.env.SIM_POOL_PREFIX ?? '')
+  ? (process.env.SIM_POOL_PREFIX as string)
+  : 'PoC-Sim-';
 const DEVICE_TYPE = 'com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro';
+const DUO_DEVICE_TYPE = 'com.apple.CoreSimulator.SimDeviceType.iPhone-Duo';
+
+/**
+ * This Mac can run an iPhone Duo simulator: the device type exists (Xcode
+ * 27.1 and later) and an installed runtime supports it.
+ */
+export function duoSupported(): boolean {
+  try {
+    if (!listDeviceTypes().some((t) => t.identifier === DUO_DEVICE_TYPE)) return false;
+    return listIOSRuntimes().some((r) =>
+      r.supportedDeviceTypes?.some((t) => t.identifier === DUO_DEVICE_TYPE),
+    );
+  } catch {
+    return false;
+  }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Device model → simctl device type / scale / orientation
@@ -125,6 +146,7 @@ function listDeviceTypes(): SimctlDeviceType[] {
 
 /** Resolve a logical DeviceModel to a concrete simctl device-type identifier. */
 export function resolveDeviceType(model: DeviceModel): string {
+  if (model === 'iPhone-Duo') return DUO_DEVICE_TYPE;
   if (model !== 'iPad-Pro') return DEVICE_TYPE;
   const ipadPros = listDeviceTypes().filter((t) => /iPad-Pro/i.test(t.identifier));
   // Prefer the largest, newest iPad Pro: 13-inch > 12.9 > 11; higher M-gen wins.
@@ -213,13 +235,19 @@ export async function ensurePool(slots: number): Promise<string[]> {
 // Boot / shutdown
 // ──────────────────────────────────────────────────────────────────────────────
 
-export async function bootSimulator(udid: string, timeoutMs = 90_000): Promise<boolean> {
+export async function bootSimulator(
+  udid: string,
+  timeoutMs = 90_000,
+  opts: { lean?: boolean } = {},
+): Promise<boolean> {
   const current = getSimulatorState(udid);
   if (current === 'Booted') return true;
 
   // Only a shut-down device's overrides are safe to rewrite (launchd_sim reads
-  // them at start).
-  if (current === 'Shutdown') await applyLean(udid);
+  // them at start). `lean: false` leaves the stock service set (the iPhone Duo,
+  // whose hinge and second panel depend on services the lean list was never
+  // checked against).
+  if (current === 'Shutdown' && opts.lean !== false) await applyLean(udid);
 
   log(`Booting ${udid}...`);
   // Don't await — `simctl boot` blocks until boot completes which can be slow;

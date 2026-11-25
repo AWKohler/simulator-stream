@@ -3,8 +3,11 @@
 // calibration so the canvas wires up correctly on reconnect.
 
 import type { WebSocket } from 'ws';
+import { DUO_DISPLAY_INDEX, encodeVideoFlags } from '@sim/shared';
 import type {
   BuildDiagnostic,
+  DuoDisplay,
+  DuoState,
   Orientation,
   ScreenRect,
   ServerToBrowser,
@@ -34,9 +37,23 @@ interface VideoConfigSnapshot {
   fps: number;
   bitrate: number;
   format: 'annexb';
+  /** iPhone Duo: which panel the stream is. */
+  display?: DuoDisplay;
+}
+
+/** One video stream's chunks since its last keyframe, kept so a browser that
+ * joins (or rejoins) gets a picture at once instead of at the next keyframe —
+ * which, for a stream that only sends when the picture changes, can be seconds
+ * away. */
+interface GopCache {
+  chunks: Buffer[];
+  bytes: number;
 }
 
 const BUILD_LOG_RING_SIZE = 200;
+/** A cached group of pictures is dropped (until the next keyframe) past this. */
+const GOP_MAX_BYTES = 12 * 1024 * 1024;
+const GOP_MAX_CHUNKS = 1200;
 
 interface SessionPipe {
   sessionId: string;
@@ -55,6 +72,13 @@ interface SessionPipe {
    * Cleared when a new build starts. */
   buildDiagnostics: BuildDiagnostic[];
   videoConfig: VideoConfigSnapshot | null;
+  /** iPhone Duo: the latest configuration of each panel's stream. */
+  duoVideoConfigs: Partial<Record<DuoDisplay, VideoConfigSnapshot>>;
+  /** iPhone Duo: the latest hinge and panel state. */
+  duoState: DuoState | null;
+  /** Chunks since the last keyframe, per stream index. Only kept for streams
+   * that asked for it (see pushVideoChunk). */
+  gops: Map<number, GopCache>;
   /** Last camera-request state from the injected shim (true once the app's
    * AVCaptureSession is running). Replayed to late joiners so a browser that
    * connects after the app opened the camera still starts streaming the webcam. */
@@ -67,6 +91,9 @@ interface SessionPipe {
 }
 
 const IDLE_GRACE_MS = parseInt(process.env.SESSION_IDLE_GRACE_MS ?? '60000', 10);
+
+/** A browser with more than this still unsent is not given a replay on top. */
+const REPLAY_MAX_PENDING_BYTES = 4 * 1024 * 1024;
 
 export class SessionProxy {
   private pipes = new Map<string, SessionPipe>();
@@ -87,6 +114,9 @@ export class SessionProxy {
         lastBuildStatus: null,
         buildDiagnostics: [],
         videoConfig: null,
+        duoVideoConfigs: {},
+        duoState: null,
+        gops: new Map(),
         cameraActive: false,
         orientation: null,
         idleTimer: null,
@@ -137,6 +167,13 @@ export class SessionProxy {
     if (p.videoConfig) {
       send(ws, { type: 'video_config', ...p.videoConfig });
     }
+    // iPhone Duo: the device's state, then each panel's stream configuration
+    // and its picture so far.
+    if (p.duoState) send(ws, { type: 'duo_state', ...p.duoState });
+    for (const config of Object.values(p.duoVideoConfigs)) {
+      if (config) send(ws, { type: 'video_config', ...config });
+    }
+    this.replayVideo(sessionId, ws);
     // Replay buffered build log + last status so a late-joining UI rebuilds context.
     for (const entry of p.buildLog) {
       send(ws, { type: 'build_log', line: entry.line, stream: entry.stream });
@@ -161,6 +198,29 @@ export class SessionProxy {
       send(ws, { type: 'orientation', orientation: p.orientation });
     }
     send(ws, { type: 'state', state: p.state });
+  }
+
+  /**
+   * Send one browser each cached stream's picture so far (see GopCache).
+   * Not to a browser that is already far behind on what it has been sent:
+   * a replay is megabytes, and one that asks again and again while reading
+   * slowly would otherwise pile them up here. It is told nothing; the next
+   * keyframe reaches it in its turn. Returns whether the replay was sent.
+   */
+  replayVideo(sessionId: string, ws: WebSocket): boolean {
+    const p = this.pipes.get(sessionId);
+    if (!p) return false;
+    if (ws.bufferedAmount > REPLAY_MAX_PENDING_BYTES) return false;
+    for (const gop of p.gops.values()) {
+      for (const packet of gop.chunks) {
+        try {
+          ws.send(packet);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return true;
   }
 
   detachBrowser(sessionId: string, ws: WebSocket): void {
@@ -207,18 +267,56 @@ export class SessionProxy {
 
   pushVideoConfig(sessionId: string, config: VideoConfigSnapshot): void {
     const p = this.ensure(sessionId);
-    p.videoConfig = config;
+    if (config.display) {
+      // A panel's stream restarted: its cached pictures belong to the old one.
+      p.duoVideoConfigs[config.display] = config;
+      p.gops.delete(DUO_DISPLAY_INDEX[config.display]);
+    } else {
+      p.videoConfig = config;
+    }
     this.broadcast(p, { type: 'video_config', ...config });
   }
 
-  pushVideoChunk(sessionId: string, timestampMs: number, keyframe: boolean, data: Buffer): void {
+  /** iPhone Duo: hinge angle and which panels are lit. */
+  pushDuoState(sessionId: string, state: DuoState): void {
+    const p = this.ensure(sessionId);
+    p.duoState = state;
+    this.broadcast(p, { type: 'duo_state', ...state });
+  }
+
+  pushVideoChunk(
+    sessionId: string,
+    timestampMs: number,
+    keyframe: boolean,
+    data: Buffer,
+    streamIndex = 0,
+  ): void {
     const p = this.pipes.get(sessionId);
-    if (!p || p.browsers.size === 0) return;
+    if (!p) return;
+    // A Duo's streams send a frame only when the picture changes, so the
+    // chunks since each one's last keyframe are kept for late joiners. (A
+    // single-panel stream has a keyframe every second and needs no cache.)
+    const cached = Object.keys(p.duoVideoConfigs).length > 0;
+    if (!cached && p.browsers.size === 0) return;
     const header = Buffer.alloc(10);
     header.writeUInt8(1, 0); // protocol version
-    header.writeUInt8(keyframe ? 1 : 0, 1);
+    header.writeUInt8(encodeVideoFlags(keyframe, streamIndex), 1);
     header.writeBigUInt64BE(BigInt(Math.max(0, Math.floor(timestampMs))), 2);
     const packet = Buffer.concat([header, data]);
+    if (cached) {
+      let gop = p.gops.get(streamIndex);
+      if (keyframe) {
+        gop = { chunks: [packet], bytes: packet.length };
+        p.gops.set(streamIndex, gop);
+      } else if (gop) {
+        if (gop.chunks.length >= GOP_MAX_CHUNKS || gop.bytes + packet.length > GOP_MAX_BYTES) {
+          p.gops.delete(streamIndex);
+        } else {
+          gop.chunks.push(packet);
+          gop.bytes += packet.length;
+        }
+      }
+    }
     for (const ws of p.browsers) {
       try {
         ws.send(packet);

@@ -268,6 +268,24 @@ const CHAR_KEYS: Record<string, [number, boolean]> = (() => {
 })();
 
 /**
+ * The keyboard usages that type `text`, as [usage, down] pairs (shift pressed
+ * around the characters that need it), or null if a character has no mapping.
+ * For input paths that send HID keyboard events themselves (the iPhone Duo).
+ */
+export function textKeyStrokes(text: string): Array<[number, boolean]> | null {
+  const strokes: Array<[number, boolean]> = [];
+  for (const ch of text) {
+    const mapped = CHAR_KEYS[ch];
+    if (!mapped) return null;
+    const [code, shift] = mapped;
+    if (shift) strokes.push([SHIFT, true]);
+    strokes.push([code, true], [code, false]);
+    if (shift) strokes.push([SHIFT, false]);
+  }
+  return strokes;
+}
+
+/**
  * Key events that type `text`, or null if any character has no HID mapping
  * (the CLI rejects those too — callers fall back to it so the failure is logged
  * the same way).

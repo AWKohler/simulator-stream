@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { BuildDiagnostic, LogStream } from '@sim/shared';
+import type { BuildDiagnostic, DeviceModel, LogStream } from '@sim/shared';
 import { execAsync, execAsSimUser, simUserEnabled } from './util.js';
 import { ensureOrientationShim } from './orientation-shim.js';
 import { log, warn } from './log.js';
@@ -46,6 +46,8 @@ export interface BuildOptions {
   tarballBuf: Buffer;
   hints?: Partial<ProjectInfo>;
   onLog: (line: string, stream: LogStream) => void;
+  /** The device the session previews on. The iPhone Duo's build differs slightly (see runBuild). */
+  deviceModel?: DeviceModel;
 }
 
 export interface DeviceBuildOptions {
@@ -217,6 +219,7 @@ export interface DeviceBuildHandle {
 export function runBuild(options: BuildOptions): BuildHandle {
   assertLocalBackendAllowed('simulator preview');
   const { sessionId, tarballBuf, hints, onLog } = options;
+  const isDuo = options.deviceModel === 'iPhone-Duo';
   const workdir = path.join(BUILDS_ROOT, sessionId);
   let proc: ChildProcess | null = null;
   let cancelled = false;
@@ -280,8 +283,14 @@ export function runBuild(options: BuildOptions): BuildHandle {
         // use). UIRequiresFullScreen is required so iPadOS doesn't reject the
         // geometry change in windowed/Stage-Manager mode. This affects the
         // simulator preview build only — never the user's device/App Store build.
-        'INFOPLIST_KEY_UIRequiresFullScreen=YES',
-        'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
+        // The iPhone Duo's build differs in two ways, both so that its inner
+        // screen follows the user whichever way round the device is turned:
+        // upside-down joins the iPhone list (turned one way, that screen's
+        // interface is upside down in the panel's own terms), and
+        // UIRequiresFullScreen is left out (with it, iOS refuses that turn;
+        // seen on iOS 27.1). Builds for the iPhone and the iPad are unchanged.
+        ...(isDuo ? [] : ['INFOPLIST_KEY_UIRequiresFullScreen=YES']),
+        `INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone=UIInterfaceOrientationPortrait${isDuo ? ' UIInterfaceOrientationPortraitUpsideDown' : ''} UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight`,
         'INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad=UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight',
         'build',
       ];

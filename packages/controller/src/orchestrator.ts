@@ -716,12 +716,21 @@ export class Orchestrator {
 
   // ── Placement ─────────────────────────────────────────────────────────────
   private placeQueued(): void {
-    while (this.queue.length > 0) {
-      const host = this.pickHost();
-      if (!host) break;
-      const sessionId = this.queue.shift()!;
+    // First come, first served — except that a session waiting for a device
+    // only some hosts have (the iPhone Duo) does not hold up the ones behind it.
+    for (let i = 0; i < this.queue.length; ) {
+      const sessionId = this.queue[i];
       const s = this.sessions.get(sessionId);
-      if (!s || s.state !== 'queued') continue;
+      if (!s || s.state !== 'queued') {
+        this.queue.splice(i, 1);
+        continue;
+      }
+      const host = this.pickHost(s.deviceModel);
+      if (!host) {
+        i++;
+        continue;
+      }
+      this.queue.splice(i, 1);
       s.hostId = host.hostId;
       host.activeSessionIds.add(sessionId);
 
@@ -746,7 +755,7 @@ export class Orchestrator {
         warn(`Failed to send start_session: ${(e as Error).message}`);
         host.activeSessionIds.delete(sessionId);
         s.hostId = null;
-        this.queue.unshift(sessionId);
+        this.queue.splice(i, 0, sessionId);
         break;
       }
       this.setSessionState(s, 'starting');
@@ -765,13 +774,22 @@ export class Orchestrator {
     (process.env.ALLOW_BARE_METAL_FALLBACK ?? '').toLowerCase() === '1' ||
     (process.env.ALLOW_BARE_METAL_FALLBACK ?? '').toLowerCase() === 'true';
 
-  private pickHost(): HostRecord | null {
+  /** Some connected host can run `deviceModel` (whether or not it has room now). */
+  supportsDeviceModel(deviceModel: DeviceModel): boolean {
+    for (const h of this.hosts.values()) {
+      if (h.deviceModels.includes(deviceModel)) return true;
+    }
+    return false;
+  }
+
+  private pickHost(deviceModel: DeviceModel): HostRecord | null {
     // Two-pass: prefer kind='vm' hosts (the isolation boundary). Only fall
     // back to bare-metal if the operator opted in AND no VM has capacity.
     const pick = (predicate: (h: HostRecord) => boolean): HostRecord | null => {
       let best: HostRecord | null = null;
       for (const h of this.hosts.values()) {
         if (!predicate(h)) continue;
+        if (!h.deviceModels.includes(deviceModel)) continue;
         const free = h.slots - h.activeSessionIds.size;
         if (free <= 0) continue;
         if (!best) {
